@@ -1,8 +1,9 @@
-from ed_utils import *
+from edslack import EdSlackAPI
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+from datetime import datetime
 import yaml
 import os
 
@@ -14,7 +15,6 @@ with open("config/credentials.yml", 'r') as stream:
 
 SLACK_BOT_TOKEN=credentials['credentials']['SLACK_BOT_TOKEN']
 SLACK_APP_TOKEN=credentials['credentials']['SLACK_APP_TOKEN']
-ED_API = credentials['credentials']['ED_API']
 
 app = App(token=SLACK_BOT_TOKEN, name="test-bot")
 
@@ -25,20 +25,23 @@ def event_test(say):
 @app.command("/current_unresolved")
 def unresolved_info(ack, say, command):
     ack()
-    session = get_session()
-    unresolved_threads = filtered_threads(session, "unresolved")
-    processed_unresolved = add_subthreads(process_user(process_json(unresolved_threads, fields)))
-    say("Unresolved threads: " + str(len(unresolved_threads)) + "\n" + str(list(processed_unresolved["title"])))
+    edSlack = EdSlackAPI(command['team_domain'])
+    unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
+    processed_unresolved = edSlack.add_subthreads(edSlack.process_user(edSlack.process_json(unresolved_threads, edSlack.fields)))
+    response = f"Hi {command['user_name']}! We have {str(len(unresolved_threads))} unresolved threads right now.\n" + str(list(processed_unresolved["title"]))
+    say(response)
 
 @app.command("/top_questions")
 def top_questions(ack, say, command):
     ack()
+    edSlack = EdSlackAPI(command['team_domain'])
     date = command["text"]
     month, day, year = date.split("/")
     up_to = datetime(int(year), int(month), int(day))
-    upto_threads = process_user(get_timeframe(up_to))
+    upto_threads = edSlack.process_user(edSlack.get_timeframe(up_to))
     upto_questions = upto_threads[upto_threads["type"] == "question"]
-    say("Top categories: " + str(upto_questions["category"].value_counts()[:5]))
+    response = f"Hi {command['user_name']}! Here are the top question categories after {date}:\n" + str(upto_questions["category"].value_counts()[:5])
+    say(response)
 
 def main():
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
