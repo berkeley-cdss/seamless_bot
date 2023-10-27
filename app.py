@@ -16,7 +16,7 @@ with open("config/credentials.yml", 'r') as stream:
 SLACK_BOT_TOKEN=credentials['credentials']['SLACK_BOT_TOKEN']
 SLACK_APP_TOKEN=credentials['credentials']['SLACK_APP_TOKEN']
 
-app = App(token=SLACK_BOT_TOKEN, name="test-bot")
+app = App(token=SLACK_BOT_TOKEN, name="seamless-bot")
 
 @app.event("app_mention")
 def event_test(say):
@@ -42,6 +42,12 @@ def top_questions(ack, say, command):
     upto_questions = upto_threads[upto_threads["type"] == "question"]
     response = f"Hi {command['user_name']}! Here are the top question categories after {date}:\n" + str(upto_questions["category"].value_counts()[:5])
     say(response)
+
+@app.command("/list-commands")
+def list_commands(ack, respond, command):
+    ack()
+    response = f"Hi {command['user_name']}! Here are the commands you can use:\n" + "/current_unresolved\n/top_questions\n"
+    respond(response)
 
 def main():
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
