@@ -1,7 +1,0 @@
-edapi
-numpy
-pandas
-requests
-datetime
-pytz
-slack-bolt
