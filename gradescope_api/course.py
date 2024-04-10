@@ -28,8 +28,38 @@ from datetime import datetime, timedelta
 import pytz
 from dateutil.parser import parse
 
-GRADESCOPE_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 cached_performance_df = None
+
+GRADESCOPE_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+import pandas as pd
+import psycopg2
+from io import StringIO
+
+# PostgreSQL connection parameters
+dbname = ...
+user = ...
+password = ...
+host = ...
+
+
+conn = psycopg2.connect(dbname=dbname, user=user, password=password, host=host)
+
+query = "SELECT * FROM ...;"
+
+cur = conn.cursor()
+cur.execute(query)
+rows = cur.fetchall()
+colnames = [desc[0] for desc in cur.description]
+cached_performance_df = pd.DataFrame(rows, columns=colnames)
+cur.close()
+conn.close()
+
+
+cached_performance_df = cached_performance_df.drop(cached_performance_df.columns[0], axis=1)
+
+
+# GRADESCOPE_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# cached_performance_df = None
 last_update_time = None
 
 
@@ -386,7 +416,10 @@ class GradescopeCourse:
     
     def get_student_performance(self, name:str):
         #preprocess dataframe
-        df = cached_performance_df
+        # if cached_performance_df is None:
+        #     return 1
+        print(cached_performance_df)
+        df = cached_performance_df.copy()
         df_copy = df.copy()
         df_copy["First Name"] = df_copy["First Name"] + " " + df_copy["Last Name"]
         df_copy = df_copy.rename(columns={"First Name": "Full Name"}).drop(columns="Last Name")
@@ -434,6 +467,7 @@ class GradescopeCourse:
         if overall_percentage < GRADE_THRESHOLD:
             return f"Average: {overall_percentage} Below Threshold\nAssignment Submitted: {num_sbumitted}/{num_assignment}\nNumber of late assignments: {num_late}\nLecture Attended: {num_lec_attended}/{max_lecture_point}\nGrade Data Last Updated: {last_update_time}\nPlease update if you would like (update may take a few moments)"
         else:
+            print(f"Average: {overall_percentage} Above Threshold\nAssignment Submitted: {num_sbumitted}/{num_assignment}\nNumber of late assignments: {num_late}\nLecture Attended: {num_lec_attended}/{max_lecture_point}\nGrade Data Last Updated: {last_update_time}\nPlease update if you would like (update may take a few moments)")
             return f"Average: {overall_percentage} Above Threshold\nAssignment Submitted: {num_sbumitted}/{num_assignment}\nNumber of late assignments: {num_late}\nLecture Attended: {num_lec_attended}/{max_lecture_point}\nGrade Data Last Updated: {last_update_time}\nPlease update if you would like (update may take a few moments)"
 
                     
