@@ -1,27 +1,32 @@
-import csv
+import pandas as pd
 import psycopg2
 
-# Connect to PostgreSQL database
-conn = psycopg2.connect(dbname=..., user=..., password=..., host=...)
-cur = conn.cursor()
+# PostgreSQL connection parameters
+dbname = ...
+user = ...
+password = ...
+host = ...
+
+# Path to your CSV file
+csv_file_path = ...
 
 # Read the CSV file and extract column names
-with open('[CSV_FILE_NAME]', 'r') as csv_file:
-    reader = csv.reader(csv_file)
-    header = next(reader)  # Get header row
-    new_columns = set(header)
+df = pd.read_csv(csv_file_path)
+column_names = df.columns.tolist()
 
-# Get existing column names from the database table
-cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'your_table_name';")
-existing_columns = {row[0] for row in cur.fetchall()}
+# Create table query
+table_name = ...
+creat_table_query = f"CREATE TABLE {table_name} ("
+for column in column_names:
+    creat_table_query+= f'"{column}" VARCHAR, '
+creat_table_query = creat_table_query[:-2] + ");"
 
-# Identify new columns
-missing_columns = new_columns - existing_columns
-
-# Alter table schema to add new columns
-for column in missing_columns:
-    cur.execute(f"ALTER TABLE your_table_name ADD COLUMN {column} TEXT;")
-
-# Commit changes and close connection
+# Connect to PostgreSQL and create the table
+conn = psycopg2.connect(dbname = dbname,user = user, password = password,host = host)
+cur = conn.cursor()
+cur.execute(creat_table_query)
 conn.commit()
+
+# Close connection
+cur.close()
 conn.close()
