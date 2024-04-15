@@ -6,7 +6,7 @@ conn = psycopg2.connect(dbname=..., user=..., password=..., host=...)
 cur = conn.cursor()
 
 # Read the CSV file and extract column names
-with open('data100.csv', 'r') as csv_file:
+with open('[CSV_FILE_NAME]', 'r') as csv_file:
     reader = csv.reader(csv_file)
     header = next(reader)  # Get header row
     new_columns = set(header)
