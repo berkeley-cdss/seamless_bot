@@ -1,0 +1,5 @@
+config/*
+__pyache__/*
+gradescope.csv
+venv
+.env

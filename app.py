@@ -29,9 +29,12 @@ SLACK_APP_TOKEN=credentials['credentials']['SLACK_APP_TOKEN']
 
 app = App(token=SLACK_BOT_TOKEN, name="test-bot")
 
+
 @app.event("app_mention")
-def event_test(say):
+def event_test(event, say):
+    print(f"Received event: {event}")  # Debugging log
     say("Hi there!")
+
 
 @app.command("/current_unresolved")
 def unresolved_info(ack, say, command):

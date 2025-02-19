@@ -35,16 +35,22 @@ import pandas as pd
 import psycopg2
 from io import StringIO
 
-# PostgreSQL connection parameters
-dbname = ...
-user = ...
-password = ...
-host = ...
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# PostgreSQL connection parameters (loaded from .env)
+dbname = os.getenv("DB_NAME")
+user = os.getenv("DB_USER")
+password = os.getenv("DB_PASSWORD")
+host = os.getenv("DB_HOST")
 
 
 conn = psycopg2.connect(dbname=dbname, user=user, password=password, host=host)
 
-query = "SELECT * FROM ...;"
+query = "SELECT * FROM c88c_gradescope LIMIT 5;"
 
 cur = conn.cursor()
 cur.execute(query)

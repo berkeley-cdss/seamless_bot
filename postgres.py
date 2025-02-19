@@ -1,21 +1,26 @@
 import pandas as pd
 import psycopg2
+import os
+from dotenv import load_dotenv
 
-# PostgreSQL connection parameters
-dbname = ...
-user = ...
-password = ...
-host = ...
+# Load environment variables from .env file
+load_dotenv()
+
+# PostgreSQL connection parameters (loaded from .env)
+dbname = os.getenv("DB_NAME")
+user = os.getenv("DB_USER")
+password = os.getenv("DB_PASSWORD")
+host = os.getenv("DB_HOST")
 
 # Path to your CSV file
-csv_file_path = ...
+csv_file_path = "gradescope.csv"
 
 # Read the CSV file and extract column names
 df = pd.read_csv(csv_file_path)
 column_names = df.columns.tolist()
 
 # Create table query
-table_name = ...
+table_name = "c88c_gradescope"
 creat_table_query = f"CREATE TABLE {table_name} ("
 for column in column_names:
     creat_table_query+= f'"{column}" VARCHAR, '
