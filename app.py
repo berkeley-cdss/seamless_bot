@@ -16,7 +16,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import yaml
 import os
 import io
@@ -175,42 +175,51 @@ def get_student_performance(ack, say, command):
 @app.command("/plot_questions")
 def plot_questions(ack, say, command, client):
     ack()
-    say(":bar_chart: Generating a plot of student questions throughout the semester...")
+    say(":bar_chart: Generating a plot of student questions...")
 
     try:
         edSlack = EdSlackAPI(command['team_domain'])
+        input_text = command["text"].strip().lower()
 
-        # Get date range from Slack command (e.g., "01/01/2024")
-        date = command["text"]
-        month, day, year = date.split("/")
-        up_to = datetime(int(year), int(month), int(day))
+        # Determine date range
+        if input_text == "last week":
+            start_date = datetime.now() - timedelta(days=7)
+        elif input_text == "last month":
+            start_date = datetime.now() - timedelta(days=30)
+        else:
+            try:
+                month, day, year = input_text.split("/")
+                start_date = datetime(int(year), int(month), int(day))
+            except ValueError:
+                say("⚠️ Invalid date format. Use MM/DD/YYYY, 'last week', or 'last month'.")
+                return
 
         # Fetch and filter student questions
-        upto_threads = edSlack.process_user(edSlack.get_timeframe(up_to))
-        upto_questions = upto_threads[upto_threads["type"] == "question"]
+        threads = edSlack.process_user(edSlack.get_timeframe(start_date))
+        questions = threads[threads["type"] == "question"]
 
-        # Check if we have data
-        if upto_questions.empty:
-            say("⚠️ No student questions found in this timeframe.")
+        # Check if data is available
+        if questions.empty:
+            say(f"⚠️ No student questions found since {start_date.strftime('%m/%d/%Y')}.")
             return
 
         # Ensure 'created_at' column exists
-        if "created_at" not in upto_questions.columns:
-            say(f"⚠️ Error: 'created_at' column not found! Available columns: {', '.join(upto_questions.columns)}")
+        if "created_at" not in questions.columns:
+            say(f"⚠️ Error: 'created_at' column not found! Available columns: {', '.join(questions.columns)}")
             return
 
-        # Convert 'created_at' to datetime using .loc[] to avoid warnings
-        upto_questions.loc[:, "created_at"] = pd.to_datetime(upto_questions["created_at"])
+        # Convert 'created_at' to datetime
+        questions.loc[:, "created_at"] = pd.to_datetime(questions["created_at"])
 
-        # Count number of questions per day
-        question_counts = upto_questions.resample("D", on="created_at").size()
+        # Count questions per day
+        question_counts = questions.resample("D", on="created_at").size()
 
         # Generate the plot
         plt.figure(figsize=(10, 5))
         plt.plot(question_counts.index, question_counts.values, marker="o", linestyle="-", label="Student Questions")
         plt.xlabel("Date")
         plt.ylabel("Number of Questions")
-        plt.title("Number of Student Questions Over Time")
+        plt.title(f"Student Questions from {start_date.strftime('%m/%d/%Y')} to Today")
         plt.xticks(rotation=45)
         plt.legend()
         plt.grid(True)
@@ -220,17 +229,17 @@ def plot_questions(ack, say, command, client):
         plt.savefig(buf, format="png", bbox_inches="tight")
         buf.seek(0)
 
-        # Upload plot to Slack correctly using client.files_upload()
+        # Upload plot to Slack
         response = client.files_upload_v2(
-            channel=command["channel_id"],  # Send the file to the correct Slack channel
+            channel=command["channel_id"],
             file=buf,
             filename="questions_plot.png",
-            title="Student Questions Over Time"
+            title=f"Student Questions from {start_date.strftime('%m/%d/%Y')} to Today"
         )
 
         # Confirm success
         if response["ok"]:
-            say("✅ Here is the plot of student questions over time.")
+            say(f"✅ Here is the student questions plot from {start_date.strftime('%m/%d/%Y')} to today.")
         else:
             say("⚠️ Failed to upload the plot.")
 
