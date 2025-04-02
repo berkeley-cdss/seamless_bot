@@ -50,7 +50,7 @@ host = os.getenv("DB_HOST")
 
 conn = psycopg2.connect(dbname=dbname, user=user, password=password, host=host)
 
-query = "SELECT * FROM c88c_gradescope LIMIT 5;"
+query = "SELECT * FROM c88c_gradescope;"
 
 cur = conn.cursor()
 cur.execute(query)
@@ -164,27 +164,31 @@ class GradescopeCourse:
 
     def get_assignments(self):
         if self.assignments:
+            print(f"✅ Cached assignments: {self.assignments.keys()}")  # Debugging log
             return self.assignments
 
-        ext = f"/courses/{self.course_id}/assignments"
-        url = self._client.get_base_url() + ext
+        url = self._client.get_base_url() + f"/courses/{self.course_id}/assignments"
         response = self._client.session.get(url=url, timeout=20)
+        
+        print(f"🔍 Gradescope Response Status: {response.status_code}")  # Debugging
+        print(f"🔍 Gradescope Response Text: {response.text[:500]}")  # Print first 500 chars for debugging
+
         check_response(response, "failed to get assignments")
+
         soup = BeautifulSoup(response.content, "html.parser")
         for row in soup.find_all("button"):
             html = str(row)
             soup = BeautifulSoup(html, 'html.parser')
             button = soup.find('button')
-            assignment_name = None
-            assignment_id = None 
+
             if button:
                 assignment_id = button.get('data-assignment-id')
-                assignment_name = button.get_text()
-                course_id_match = re.search(r'course-(\d+)', str(button.get('aria-describedby')))
-                if course_id_match and int(course_id_match.group(1)) == self.course_id:
-                    if assignment_name and assignment_id:
-                        self.assignments[assignment_name] = assignment_id
+                assignment_name = button.get_text().strip()
+                self.assignments[assignment_name] = assignment_id
+
+        print(f"📌 Final Available Assignments: {list(self.assignments.keys())}")  # Debugging
         return self.assignments
+
 
     def get_extensions(self, assignment_name: str):
         assignment_list = self.get_assignments()
@@ -352,18 +356,22 @@ class GradescopeCourse:
                         if response.ok:
                             return 
 
-    def get_student_id(self, name: str, email_input: str, SID: str):
+
+    def get_student_id(self, name: str = None, email_input: str = None, SID: str = None):
+        """
+        Retrieves the user ID based on name, email, or SID. If none of these match a student, it returns an error message.
+        """
         course_id = self.course_id
         response = self._client.session.get(
             f"https://www.gradescope.com/courses/{course_id}/memberships", timeout=20
         )
 
         if not response.ok:
-            return
+            return "Error: Failed to fetch course membership data from Gradescope."
 
         soup = BeautifulSoup(response.content, "html.parser")
 
-        # Extract the student data from the HTML
+        # Extract student data from the HTML
         students_data = []
         for row in soup.find_all("button", class_="rosterCell--editIcon"):
             data_cm = json.loads(row["data-cm"]) if "data-cm" in row.attrs else {}
@@ -374,34 +382,56 @@ class GradescopeCourse:
 
         df = pd.DataFrame(students_data)
 
-        #get user_id
+        # Get user_id mapping
         response2 = self._client.session.get(
             f"https://www.gradescope.com/courses/{course_id}/extensions", timeout=20
         )
-        soup2 = BeautifulSoup(response2.content, "html.parser")
-        props2 = soup2.find(
-            "li", {"data-react-class": "AddExtension"})["data-react-props"]
-        data = json.loads(props2)
-        students = {row["email"]: row["id"]
-                    for row in data.get("students", [])}
-        user_id = students.get(email)
-        df.dropna()
-        df['user_id'] = [students.get(i) for i in df['email']]
-        df = df.dropna()
-        df['user_id'] =df['user_id'].astype(str).str[:-2]
+        
+        if not response2.ok:
+            return "Error: Failed to fetch extension data from Gradescope."
 
-        if name is None and email_input is None and SID is None:
-            print(df)
-            return df
-        elif name is not None:
-            print(df[df['full_name'] == name]['user_id'].values[0])
-            return df[df['full_name'] == name]['user_id'].values[0]
-        elif SID is not None:
-            print(df[df['SID'] == SID]['user_id'].values[0])
-            return df[df['SID'] == SID]['user_id'].values[0]
-        elif email_input is not None:
-            print(df[df['email'] == email_input]['user_id'].values[0])
-            return df[df['email'] == email_input]['user_id'].values[0]
+        soup2 = BeautifulSoup(response2.content, "html.parser")
+        props2 = soup2.find("li", {"data-react-class": "AddExtension"})
+
+        if props2 is None:
+            return "Error: Unable to extract user ID mappings from Extensions page."
+
+        data = json.loads(props2["data-react-props"])
+        students = {row["email"]: row["id"] for row in data.get("students", [])}
+        df['user_id'] = df['email'].map(students)
+
+        df.dropna(inplace=True)
+        df['user_id'] = df['user_id'].astype(str).str[:-2]
+
+        # Debugging: Print DataFrame
+        print(f"📌 Full Student Data: \n{df.head()}")
+
+        if name:
+            filtered_df = df[df['full_name'].str.lower() == name.lower()]
+            if filtered_df.empty:
+                return f"Error: No user found for name '{name}'"
+            user_id = filtered_df['user_id'].values[0]
+            print(f"✅ Found user ID for {name}: {user_id}")
+            return user_id
+
+        if SID:
+            filtered_df = df[df['SID'] == SID]
+            if filtered_df.empty:
+                return f"Error: No user found for SID '{SID}'"
+            user_id = filtered_df['user_id'].values[0]
+            print(f"✅ Found user ID for SID {SID}: {user_id}")
+            return user_id
+
+        if email_input:
+            filtered_df = df[df['email'].str.lower() == email_input.lower()]
+            if filtered_df.empty:
+                return f"Error: No user found for email '{email_input}'"
+            user_id = filtered_df['user_id'].values[0]
+            print(f"✅ Found user ID for {email_input}: {user_id}")
+            return user_id
+
+        print(df)  # If no filters are given, print the whole DataFrame
+        return df
     
     def download_grades_csv(self):
         url = f"https://www.gradescope.com/courses/{self.course_id}/gradebook.csv"
