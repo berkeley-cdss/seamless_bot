@@ -21,8 +21,20 @@ import yaml
 import os
 import io
 import base64
+import gspread
+import requests
+from bcourses import CanvasClient 
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
-
+# Google Sheets API
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SERVICE_ACCOUNT_FILE = "gspread-api.json"
+creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+service = build('sheets', 'v4', credentials=creds)
+SPREADSHEET_ID = "1N9Ep22MZJPwGEcfdbOiCSd93oVr2A6iKSXibaGyUFs4"
+EXTENSIONS_ID = "1V0hP7au5CyO9mWK9X2IeH4z0aqxJaeXJz5qz8EgGS8A"
+EXTENSIONS_RANGE = "Form Responses!A1:N"
 
 
 with open("config/credentials.yml", 'r') as stream:
@@ -151,6 +163,53 @@ def get_user_id(ack, say, command):
 
     say(response)
 
+
+@app.command("/get_user_info")
+def get_user_info(ack, say, command):
+    ack()
+    say(":mag: Fetching student info... Please wait.")
+
+    input_text = command["text"].strip()
+
+    # Ensure input is provided
+    if not input_text:
+        say("⚠️ Please provide a name, email, or SID. Example: `/get_user_info John Doe`")
+        return
+
+    # Connect to Gradescope API
+    GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=COURSE_ID)
+
+    try:
+        # Assume get_student_id exists and returns a DataFrame
+        student_info = None
+        
+        if "@" in input_text:  # Input is an email
+            student_info = GC.get_student_id(None, input_text, None)
+        elif input_text.isdigit():  # Input is a student ID (SID)
+            student_info = GC.get_student_id(None, None, input_text)
+        else:  # Assume it's a name
+            student_info = GC.get_student_id(input_text, None, None)
+
+        # Check if any student info was found
+        if student_info is None or isinstance(student_info, str):
+            say(f"⚠️ No student found matching `{input_text}`.")
+            return
+
+        # Extract student information
+        response = f"✅ Student Info for `{input_text}`:\n"
+        if isinstance(student_info, pd.DataFrame) and not student_info.empty:
+            for _, row in student_info.iterrows():
+                response += f"👤 Name: {row.get('Name', 'N/A')}\n📧 Email: {row.get('Email', 'N/A')}\n🆔 SID: {row.get('SID', 'N/A')}\n\n"
+        else:
+            response += "⚠️ No matching student found."
+
+        say(response)
+
+    except Exception as e:
+        print(f"❌ Error in /get_user_info: {e}")
+        say(f"⚠️ Error fetching student info: {e}")
+
+
 @app.command("/get_student_performance")
 def get_student_performance(ack, say, command):
     ack()
@@ -246,6 +305,224 @@ def plot_questions(ack, say, command, client):
     except Exception as e:
         print(f"❌ Error in /plot_questions: {e}")
         say(f"⚠️ Error generating plot: {e}")
+
+@app.command("/lab_attendance")
+def lab_attendance(ack, say, command):
+    ack()
+    input_name = command["text"].strip().lower()
+
+    try:
+        # Load attendance sheet from Google Sheets
+        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range='Form Responses 1!A1:G'
+        ).execute()
+        rows = result.get("values", [])
+        df = pd.DataFrame(rows[1:], columns=rows[0])
+
+        # Combine First + Last Name for comparison
+        df["Full Name"] = (df["First Name"].str.strip() + " " + df["Last Name"].str.strip()).str.lower()
+
+        # Match student by full name (case insensitive)
+        matched = df[df["Full Name"].str.contains(input_name)]
+
+        if matched.empty:
+            say(f"⚠️ Couldn't find attendance info for '{input_name}'")
+            return
+        elif len(matched["Full Name"].unique()) > 1:
+            options = ", ".join(matched['Full Name'].unique()[:5])  # just in case there are too many
+            say(f"⚠️ Found multiple matches: {options}. Be more specific.")
+            return
+
+        student_name = matched["Full Name"].iloc[0].title()
+        attendance_count = matched.shape[0]
+        say(f"✅ {student_name} has attended {attendance_count} lab(s).")
+
+    except Exception as e:
+        say(f"❌ Error accessing attendance: {e}")
+
+
+@app.command("/extensions_count")
+def extensions_count(ack, say, command):
+    ack()
+    query = command["text"].strip().lower()
+
+    say(f"🔍 Fetching extension request count for: `{query}`...")
+
+    try:
+        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=EXTENSIONS_ID, range=EXTENSIONS_RANGE
+        ).execute()
+        rows = result.get("values", [])
+        if not rows:
+            say("⚠️ No extension data found.")
+            return
+        df = pd.DataFrame(rows[1:], columns=rows[0])
+        df.columns = df.columns.str.strip()  # Clean up any spacing
+
+        match = df[
+            df["Email Address"].str.lower().str.contains(query) |
+            df["Student ID Number"].str.lower().str.contains(query)
+        ]
+        count = match.shape[0]
+        if count == 0:
+            say(f"❌ No extension requests found for `{query}`.")
+        else:
+            say(f"📬 `{query}` has submitted {count} extension request(s).")
+
+    except Exception as e:
+        print(f"❌ Error in /extensions_count: {e}")
+        say(f"❌ Error accessing extension data: {e}")
+
+
+@app.command("/plot_attendance")
+def plot_attendance(ack, say, command, client):
+    ack()
+    say(":bar_chart: Generating attendance plot by section...")
+
+    try:
+        # Load attendance sheet from Google Sheets
+        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range='Form Responses 1!A1:G'
+        ).execute()
+        rows = result.get("values", [])
+        df = pd.DataFrame(rows[1:], columns=rows[0])
+
+        # Parse timestamps
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df['Week'] = df['Timestamp'].dt.to_period("W").apply(lambda r: r.start_time)
+
+        # Count attendance per section per week
+        attendance_summary = df.groupby(['Week', 'Section']).size().unstack(fill_value=0)
+
+        # Plot
+        plt.figure(figsize=(12, 6))
+        for section in attendance_summary.columns:
+            plt.plot(attendance_summary.index, attendance_summary[section], marker='o', label=section)
+
+        plt.xlabel("Week")
+        plt.ylabel("Attendance Count")
+        plt.title("Weekly Attendance by Section")
+        plt.xticks(rotation=45)
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+
+        response = client.files_upload_v2(
+            channel=command["channel_id"],
+            file=buf,
+            filename="attendance_by_section.png",
+            title="Weekly Attendance by Section"
+        )
+
+        if response["ok"]:
+            say("✅ Here is the attendance plot by section!")
+        else:
+            say("⚠️ Failed to upload the attendance plot.")
+
+    except Exception as e:
+        print(f"❌ Error in /plot_attendance: {e}")
+        say(f"❌ Error generating attendance plot: {e}")
+
+
+@app.command("/plot_extensions")
+def plot_extensions(ack, say, command, client):
+    ack()
+    say(":bar_chart: Generating extension request plot...")
+
+    try:
+        # Connect to Google Sheets
+        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+
+        result = service.spreadsheets().values().get(
+            spreadsheetId=EXTENSIONS_ID, range=EXTENSIONS_RANGE
+        ).execute()
+        rows = result.get("values", [])
+        if not rows:
+            say("⚠️ No extension data found.")
+            return
+
+        df = pd.DataFrame(rows[1:], columns=rows[0])
+        df.columns = df.columns.str.strip()
+
+        # Parse timestamps
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.dropna(subset=["Timestamp"])  # Drop rows with bad/missing dates
+
+        # Count extensions by day
+        daily_counts = df["Timestamp"].dt.date.value_counts().sort_index()
+
+        # Plot
+        plt.figure(figsize=(10, 5))
+        plt.plot(daily_counts.index, daily_counts.values, marker="o", linestyle="-")
+        plt.xticks(rotation=45)
+        plt.title("Daily Extension Requests")
+        plt.xlabel("Date")
+        plt.ylabel("Number of Requests")
+        plt.grid(True)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+
+        # Upload to Slack
+        response = client.files_upload_v2(
+            channel=command["channel_id"],
+            file=buf,
+            filename="extensions_plot.png",
+            title="Daily Extension Requests"
+        )
+
+        if response["ok"]:
+            say("✅ Here's the plot of daily extension requests.")
+        else:
+            say("⚠️ Failed to upload plot.")
+
+    except Exception as e:
+        print(f"❌ Error in /plot_extensions: {e}")
+        say(f"❌ Error generating plot: {e}")
+
+@app.command("/get_grade")
+def get_grade(ack, say, command):
+    ack()
+    query = command["text"].strip()
+
+    if not query:
+        say("⚠️ Please provide a full name or SIS ID. Example: `/get_grade Rebecca Dang` or `/get_grade 123456789`")
+        return
+
+    try:
+        say(f"🔍 Fetching grade for `{query}` from Canvas...")
+
+        canvas = CanvasClient(
+            token=credentials["credentials"]["CANVAS_TOKEN"],
+            base_url=credentials["credentials"]["CANVAS_API_URL"]
+        )
+
+        course_id = credentials["credentials"]["CANVAS_ID"]
+        grade_data = canvas.get_student_grade(course_id, query)
+
+        if grade_data is None:
+            say(f"❌ No student found for `{query}`.")
+        elif grade_data["score"] is None:
+            say(f"ℹ️ Found *{grade_data['name']}* (SIS ID: `{grade_data['sis_id']}`), but no grade is available yet.")
+        else:
+            say(f"📊 *{grade_data['name']}* (SIS ID: `{grade_data['sis_id']}`) currently has a grade of *{grade_data['score']:.2f}%*.")
+
+    except Exception as e:
+        print(f"❌ Error in /get_grade: {e}")
+        say(f"❌ Error fetching grade: {e}")
+
+
 
 def main():
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
