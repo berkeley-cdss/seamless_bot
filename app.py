@@ -1,9 +1,11 @@
 from edslack import EdSlackAPI
 import sys
+import time
+from pytz import timezone
+from functools import wraps
 sys.path.append('..')
 
 from course_constants import *
-
 import getpass
 from gradescope_api.client import GradescopeClient
 from gradescope_api.course import GradescopeCourse
@@ -45,6 +47,31 @@ with open("config/credentials.yml", 'r') as stream:
 
 SLACK_BOT_TOKEN=credentials['credentials']['SLACK_BOT_TOKEN']
 SLACK_APP_TOKEN=credentials['credentials']['SLACK_APP_TOKEN']
+ed_course_id = credentials["credentials"]["ED_COURSE_IDS"]["cs88staff"]
+
+def log_command(command_name):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(ack, say, command, *args, **kwargs):
+            ack()
+            user = command.get("user_name", "unknown_user")
+            command_text = command.get("text", "").strip() or "(no input)"
+            timestamp = datetime.now(timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
+            start_time = time.perf_counter()
+
+            say(f"Message received ({timestamp}) from @{user}: `{command_name} {command_text}`")
+
+            try:
+                result = func(ack, say, command, *args, **kwargs)
+                elapsed = round((time.perf_counter() - start_time) * 1000)
+                say(f"⏱️ Command `{command_name}` completed successfully, response took `{elapsed}ms`.")
+                return result
+            except Exception as e:
+                elapsed = round((time.perf_counter() - start_time) * 1000)
+                say(f"❌ Error in `{command_name}` after `{elapsed}ms`: {e}")
+                raise e
+        return wrapper
+    return decorator
 
 app = App(token=SLACK_BOT_TOKEN, name="test-bot")
 
@@ -56,33 +83,37 @@ def event_test(event, say):
 
 
 @app.command("/current_unresolved")
+@log_command("/current_unresolved")
 def unresolved_info(ack, say, command):
     ack()
-    print(f"🔍 Received command: {command}")  # Log incoming command
-    
+    edSlack = EdSlackAPI(command["team_domain"])
+
     try:
-        edSlack = EdSlackAPI(command['team_domain'])
-        print("✅ Initialized EdSlackAPI")  # Log API initialization
-        
         unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
-        print(f"🔍 Found {len(unresolved_threads)} unresolved threads")  # Log thread count
-        
+
         if not unresolved_threads:
-            say("No unresolved threads found.")
+            say("✅ No unresolved threads found!")
             return
-        
+
         processed_unresolved = edSlack.add_subthreads(
             edSlack.process_user(edSlack.process_json(unresolved_threads, edSlack.fields))
         )
-        print("✅ Processed unresolved threads")  # Log processing
+        lines = []
+        for _, row in processed_unresolved.head(5).iterrows():
+            title = row.get("title", "Untitled")
+            post_id = row.get("id", "")
+            link = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
+            lines.append(f"• <{link}|{title}>")
 
-        response = f"Hi {command['user_name']}! We have {str(len(unresolved_threads))} unresolved threads right now.\n"
-        response += str(list(processed_unresolved["title"]))
-        
+        response = f"Hi {command['user_name']}! We have {len(processed_unresolved)} unresolved thread(s):\n" + "\n".join(lines)
+        if len(processed_unresolved) > 5:
+            response += f"\n...and {len(processed_unresolved) - 5} more."
+
         say(response)
+
     except Exception as e:
         print(f"❌ Error in /current_unresolved: {e}")
-        say(f"An error occurred: {e}")
+        say(f"❌ Error processing unresolved threads: {e}")
 
 
 @app.command("/top_questions")
@@ -432,64 +463,56 @@ def plot_attendance(ack, say, command, client):
         print(f"❌ Error in /plot_attendance: {e}")
         say(f"❌ Error generating attendance plot: {e}")
 
-
 @app.command("/plot_extensions")
+@log_command("/plot_extensions")
 def plot_extensions(ack, say, command, client):
-    ack()
-    say(":bar_chart: Generating extension request plot...")
+    creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+    service = build('sheets', 'v4', credentials=creds)
 
-    try:
-        # Connect to Google Sheets
-        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
-        service = build('sheets', 'v4', credentials=creds)
+    result = service.spreadsheets().values().get(
+        spreadsheetId=EXTENSIONS_ID, range=EXTENSIONS_RANGE
+    ).execute()
 
-        result = service.spreadsheets().values().get(
-            spreadsheetId=EXTENSIONS_ID, range=EXTENSIONS_RANGE
-        ).execute()
-        rows = result.get("values", [])
-        if not rows:
-            say("⚠️ No extension data found.")
-            return
+    rows = result.get("values", [])
+    if not rows:
+        say("⚠️ No extension data found.")
+        return
 
-        df = pd.DataFrame(rows[1:], columns=rows[0])
-        df.columns = df.columns.str.strip()
+    df = pd.DataFrame(rows[1:], columns=rows[0])
+    df.columns = df.columns.str.strip()
 
-        # Parse timestamps
-        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-        df = df.dropna(subset=["Timestamp"])  # Drop rows with bad/missing dates
+    # Parse and clean timestamps
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    df = df.dropna(subset=["Timestamp"])
 
-        # Count extensions by day
-        daily_counts = df["Timestamp"].dt.date.value_counts().sort_index()
+    # Count by day
+    daily_counts = df["Timestamp"].dt.date.value_counts().sort_index()
 
-        # Plot
-        plt.figure(figsize=(10, 5))
-        plt.plot(daily_counts.index, daily_counts.values, marker="o", linestyle="-")
-        plt.xticks(rotation=45)
-        plt.title("Daily Extension Requests")
-        plt.xlabel("Date")
-        plt.ylabel("Number of Requests")
-        plt.grid(True)
+    # Plot
+    plt.figure(figsize=(10, 5))
+    plt.plot(daily_counts.index, daily_counts.values, marker="o", linestyle="-")
+    plt.xticks(rotation=45)
+    plt.title("Daily Extension Requests")
+    plt.xlabel("Date")
+    plt.ylabel("Number of Requests")
+    plt.grid(True)
 
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-        buf.seek(0)
+    # Save to buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
 
-        # Upload to Slack
-        response = client.files_upload_v2(
-            channel=command["channel_id"],
-            file=buf,
-            filename="extensions_plot.png",
-            title="Daily Extension Requests"
-        )
+    # Upload to Slack
+    response = client.files_upload_v2(
+        channel=command["channel_id"],
+        file=buf,
+        filename="extensions_plot.png",
+        title="Daily Extension Requests"
+    )
 
-        if response["ok"]:
-            say("✅ Here's the plot of daily extension requests.")
-        else:
-            say("⚠️ Failed to upload plot.")
+    if not response["ok"]:
+        say("⚠️ Failed to upload plot.")
 
-    except Exception as e:
-        print(f"❌ Error in /plot_extensions: {e}")
-        say(f"❌ Error generating plot: {e}")
 
 @app.command("/get_grade")
 def get_grade(ack, say, command):
@@ -497,7 +520,7 @@ def get_grade(ack, say, command):
     query = command["text"].strip()
 
     if not query:
-        say("⚠️ Please provide a full name or SIS ID. Example: `/get_grade Rebecca Dang` or `/get_grade 123456789`")
+        say("⚠️ Please provide a full name or SID. Example: `/get_grade Edwin Vargas Navarro` or `/get_grade 123456789`")
         return
 
     try:
