@@ -86,3 +86,13 @@ class EdSlackAPI:
     response = session.get(BASE_URL + "courses/" + str(self.course_id) + "/threads", params={"filter": filter})
     if response.ok:
       return response.json()["threads"]
+  
+  def compute_ed_posts_from_threads(self, threads_df):
+      threads_df["Full Name"] = threads_df["user"].apply(
+          lambda user: f"{user.get('first_name', '').strip()} {user.get('last_name', '').strip()}".lower()
+      )
+      ed_post_counts = threads_df["Full Name"].value_counts().reset_index()
+      ed_post_counts.columns = ["Full Name", "Ed Posts"]
+      return ed_post_counts
+
+  

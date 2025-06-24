@@ -14,6 +14,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import matplotlib
+from scipy.stats import percentileofscore
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -25,6 +26,7 @@ import io
 import base64
 import gspread
 import requests
+import numpy as np
 from bcourses import CanvasClient 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -248,12 +250,13 @@ def get_student_performance(ack, say, command):
     GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id = COURSE_ID)
 
     result = GC.get_student_performance(name)
-    response = f"Hi {command['user_name']}! Here are the approximate performance for {name}\n{result}"
+    response = f"Hi {command['user_name']}! Here are the approximate performance for REDACTED\n{result}"
     # print(response)
     say(response)
 
 @app.command("/refresh_gradescope")
 def get_student_performance(ack, say, command):
+    global cached_performance_df
     ack()
     GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id = COURSE_ID)
 
@@ -545,6 +548,145 @@ def get_grade(ack, say, command):
         print(f"❌ Error in /get_grade: {e}")
         say(f"❌ Error fetching grade: {e}")
 
+@app.command("/plot_student_radar")
+def plot_student_radar(ack, say, command, client):
+    ack()
+    name = command["text"].strip()
+
+    try:
+        # Fetch Gradescope performance data
+        GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=COURSE_ID)
+        GC.update_performance_data()
+        df = GC.get_student_performance_df()
+
+        # Load lab attendance data from Google Sheets
+        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Form Responses 1!A1:G'
+        ).execute()
+        rows = result.get("values", [])
+        lab_df = pd.DataFrame(rows[1:], columns=rows[0]) if rows else pd.DataFrame()
+
+        # Fetch Ed involvement data
+        edSlack = EdSlackAPI(command['team_domain'])
+        raw_threads = edSlack.filtered_threads(edSlack.session, "all")
+        raw_df = edSlack.process_json(raw_threads, edSlack.fields)  # raw with 'user'
+        ed_posts_df = edSlack.compute_ed_posts_from_threads(raw_df)  # post counts
+        # Ed posts df must include First Name, Last Name, Ed Posts
+
+        # Generate radar plot
+        plot_buf = generate_student_radar_plot(name, df, lab_df=lab_df, ed_df=ed_posts_df)
+
+        # Upload to Slack
+        client.files_upload_v2(
+            channel=command["channel_id"],
+            file=plot_buf,
+            filename="radar_plot.png",
+            title=f"Radar Plot for REDACTED"
+        )
+        say(f"✅ Here's the radar plot for REDACTED!")
+
+    except Exception as e:
+        print(f"❌ Error generating radar plot: {e}")
+        say(f"❌ Error generating radar plot: {e}")
+
+def generate_student_radar_plot(student_name, df, lab_df=None, ed_df=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from scipy.stats import percentileofscore
+    import io
+
+    categories = ["Labs", "Homework", "Projects", "Exams", "Lab Attendance", "Ed Involvement"]
+    scores = []
+
+    # Standardize name matching
+    def normalize_name(name):
+        return name.strip().lower()
+
+    student_name_norm = normalize_name(student_name)
+
+    # Add normalized full name to df if not present
+    if "Full Name" not in df.columns:
+        df["Full Name"] = (df["First Name"].str.strip() + " " + df["Last Name"].str.strip()).str.lower()
+
+    student_row = df[df["Full Name"] == student_name_norm]
+    if student_row.empty:
+        raise ValueError(f"Student '{student_name}' not found in performance data.")
+    student = student_row.iloc[0]
+
+    # Normalized sum scoring helper
+    def normalized_sum(prefix):
+        cols = [col for col in df.columns if col.startswith(prefix) and "Max Points" not in col]
+        max_cols = [col + " - Max Points" for col in cols if col + " - Max Points" in df.columns]
+        total = pd.to_numeric(student[cols], errors='coerce').sum()
+        max_total = pd.to_numeric(student[max_cols], errors='coerce').sum()
+        return round(min(5, total / max_total * 5), 2) if max_total > 0 else 0
+
+    # Score 1: Labs
+    scores.append(normalized_sum("Lab"))
+
+    # Score 2: Homework
+    scores.append(normalized_sum("Homework"))
+
+    # Score 3: Projects
+    scores.append(normalized_sum("Project"))
+
+    # Score 4: Exams (average of Midterm and Final)
+    def normalized_exam_score():
+        exam_scores = []
+        for exam in ["Midterm", "Final"]:
+            exam_cols = [col for col in df.columns if col.startswith(exam) and "Max Points" not in col]
+            max_cols = [col + " - Max Points" for col in exam_cols if col + " - Max Points" in df.columns]
+            score = pd.to_numeric(student[exam_cols], errors='coerce').sum()
+            max_score = pd.to_numeric(student[max_cols], errors='coerce').sum()
+            if max_score > 0:
+                exam_scores.append(score / max_score)
+        return round(sum(exam_scores) / len(exam_scores) * 5, 2) if exam_scores else 0
+    scores.append(normalized_exam_score())
+
+    # Score 5: Lab Attendance
+    lab_score = 0
+    if lab_df is not None:
+        if "Full Name" not in lab_df.columns:
+            lab_df["Full Name"] = (lab_df["First Name"].str.strip() + " " + lab_df["Last Name"].str.strip()).str.lower()
+        lab_matches = lab_df[lab_df["Full Name"] == student_name_norm]
+        lab_score = min(5, lab_matches.shape[0])
+    scores.append(lab_score)
+
+    # Score 6: Ed Involvement (percentile)
+    ed_score = 0
+    if ed_df is not None and "Ed Posts" in ed_df.columns:
+        if "Full Name" not in ed_df.columns:
+            ed_df["Full Name"] = (ed_df["First Name"].str.strip() + " " + ed_df["Last Name"].str.strip()).str.lower()
+        ed_df["Ed Posts"] = pd.to_numeric(ed_df["Ed Posts"], errors="coerce").fillna(0)
+        student_ed = ed_df[ed_df["Full Name"] == student_name_norm]
+        if not student_ed.empty:
+            posts = student_ed.iloc[0]["Ed Posts"]
+            ed_score = round(percentileofscore(ed_df["Ed Posts"], posts) / 100 * 5, 2)
+    scores.append(ed_score)
+
+    # Close radar loop
+    scores += scores[:1]
+    angles = [n / float(len(categories)) * 2 * np.pi for n in range(len(categories))]
+    angles += angles[:1]
+
+    # Plot
+    plt.figure(figsize=(6, 6))
+    ax = plt.subplot(111, polar=True)
+    ax.plot(angles, scores, linewidth=2)
+    ax.fill(angles, scores, alpha=0.25)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories)
+    plt.title(f"Student Radar Plot: REDACTED", size=15, y=1.08)
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    plt.close()
+
+    return buf
 
 
 def main():

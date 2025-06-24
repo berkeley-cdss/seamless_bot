@@ -19,6 +19,7 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from scipy.stats import percentileofscore
 if TYPE_CHECKING:
     from gradescope_api.client import GradescopeClient
 
@@ -27,6 +28,8 @@ from datetime import datetime, timedelta
 
 import pytz
 from dateutil.parser import parse
+import matplotlib.pyplot as plt
+import numpy as np
 
 cached_performance_df = None
 
@@ -448,65 +451,56 @@ class GradescopeCourse:
         cached_performance_df = new_performance_df
         last_update_time = datetime.now()
     
-    
-    
-    def get_student_performance(self, name:str):
-        #preprocess dataframe
-        # if cached_performance_df is None:
-        #     return 1
-        print(cached_performance_df)
+    def get_student_performance(self, name: str):
+        if cached_performance_df is None:
+            return "No data loaded. Run `/refresh_gradescope` first."
+
         df = cached_performance_df.copy()
-        df_copy = df.copy()
-        df_copy["First Name"] = df_copy["First Name"] + " " + df_copy["Last Name"]
-        df_copy = df_copy.rename(columns={"First Name": "Full Name"}).drop(columns="Last Name")
-        student_data = df_copy[df_copy["Full Name"] == name]
+        df["Full Name"] = df["First Name"] + " " + df["Last Name"]
+        student_row = df[df["Full Name"] == name]
 
-        #get score preformance
-        first_null_column = student_data.columns[student_data.isnull().all()].min()
-        index_of_null_column = student_data.columns.get_loc(first_null_column)
-        student_data = pd.DataFrame(student_data.iloc[:, :index_of_null_column])
+        if student_row.empty:
+            return f"No student found with name '{name}'."
 
-        max_total = student_data.iloc[0, 5:-1:4]
-        max_total = pd.to_numeric(max_total, errors='coerce')
-        max_total = max_total.sum()
+        student_row = student_row.iloc[0]
 
+        # 1. Compute total score
+        score_cols = [col for col in df.columns if not col.endswith("Max Points") and not col.endswith("Submission Time") and not col.endswith("Lateness (H:M:S)") and col not in ["First Name", "Last Name", "SID", "Email", "Sections", "Full Name"]]
+        max_cols = [col + " - Max Points" for col in score_cols if col + " - Max Points" in df.columns]
 
-        student_total = student_data.iloc[0, 4:-1:4]
-        student_total = pd.to_numeric(student_total, errors='coerce')
-        student_total = student_total.sum()
-        overall_percentage = student_total / max_total * 100
-        #get number of late assignments
-        assignment_late = student_data.iloc[:, 7:-1:4]
+        student_total = pd.to_numeric(student_row[score_cols], errors='coerce').sum()
+        max_total = pd.to_numeric(student_row[max_cols], errors='coerce').sum()
+
+        if max_total == 0:
+            return "Max score is 0 — grading not set up properly."
+
+        percentage = student_total / max_total * 100
+
+        # 2. Count late assignments
+        late_cols = [col for col in df.columns if col.endswith("Lateness (H:M:S)")]
         num_late = 0
-        for column in assignment_late.columns:
-            lateness_hours = assignment_late[column].str.split(':').str[0].astype(int).sum()
-            
-            if lateness_hours > 0:
-                num_late +=1
-        
+        for col in late_cols:
+            try:
+                lateness = student_row[col]
+                if pd.notna(lateness) and isinstance(lateness, str):
+                    hours = int(lateness.split(":")[0])
+                    if hours > 0:
+                        num_late += 1
+            except Exception:
+                continue
 
-        #get number of assignment submitted
-        num_sbumitted = 0
-        num_assignment =0
-        assignment_total= student_data.iloc[:, 4:-1:4]
-        for column in assignment_total.columns:
-            num_assignment+=1
-            if not assignment_total[column].isnull().any():
-                num_sbumitted +=1
-                
-        
-        #get lecture attendance
-        num_lec_attended = student_data['Lecture Attendance'].iloc[0]
-        max_lecture_point = student_data['Lecture Attendance - Max Points'].iloc[0]
-        
+        # 3. Count submissions
+        submitted = pd.to_numeric(student_row[score_cols], errors='coerce').notna().sum()
+        total_assignments = len(score_cols)
 
-        if overall_percentage < GRADE_THRESHOLD:
-            return f"Average: {overall_percentage} Below Threshold\nAssignment Submitted: {num_sbumitted}/{num_assignment}\nNumber of late assignments: {num_late}\nLecture Attended: {num_lec_attended}/{max_lecture_point}\nGrade Data Last Updated: {last_update_time}\nPlease update if you would like (update may take a few moments)"
-        else:
-            print(f"Average: {overall_percentage} Above Threshold\nAssignment Submitted: {num_sbumitted}/{num_assignment}\nNumber of late assignments: {num_late}\nLecture Attended: {num_lec_attended}/{max_lecture_point}\nGrade Data Last Updated: {last_update_time}\nPlease update if you would like (update may take a few moments)")
-            return f"Average: {overall_percentage} Above Threshold\nAssignment Submitted: {num_sbumitted}/{num_assignment}\nNumber of late assignments: {num_late}\nLecture Attended: {num_lec_attended}/{max_lecture_point}\nGrade Data Last Updated: {last_update_time}\nPlease update if you would like (update may take a few moments)"
+        status = "Above" if percentage >= GRADE_THRESHOLD else "Below"
 
-                    
+        return (
+            f"Average: {percentage:.2f} ({status} Threshold)\n"
+            f"Assignments Submitted: {submitted}/{total_assignments}\n"
+            f"Late Assignments: {num_late}\n"
+            f"Last Updated: {last_update_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
-    
-
+    def get_student_performance_df(self):
+        return cached_performance_df.copy()
