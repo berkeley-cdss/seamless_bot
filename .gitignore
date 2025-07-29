@@ -1,5 +1,5 @@
-config/*
-__pyache__/*
+*/config
+gradescope_api/__pycache__
 gradescope.csv
 gspread-api.json
 venv

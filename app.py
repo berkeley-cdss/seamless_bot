@@ -30,6 +30,17 @@ import numpy as np
 from bcourses import CanvasClient 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
+import pytz
+import threading
+
+
+# Edstem Tracker
+ALERT_CHANNEL = "#seamless-bot-dev"  # Replace with your real Slack channel
+ED_ALERT_HOURS = 1  # Number of hours before a post is considered overdue
+NOTIFY_HOURS = (8, 23)  # Only send pings between 08:00–23:59
+alerted_post_ids = set()  # Track already pinged Ed posts
 
 # Google Sheets API
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -688,8 +699,88 @@ def generate_student_radar_plot(student_name, df, lab_df=None, ed_df=None):
 
     return buf
 
+def check_unanswered_edposts():
+    try:
+        now = datetime.now(pytz.timezone("America/Los_Angeles"))
+        if not (NOTIFY_HOURS[0] <= now.hour <= NOTIFY_HOURS[1]):
+            print(f"⏰ Skipping check at {now.strftime('%H:%M')} — outside active hours.")
+            return
+
+        edSlack = EdSlackAPI("data100staff")  # Replace with your team domain
+        unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
+
+        if not unresolved_threads:
+            print("✅ No unresolved Ed posts found.")
+            return
+
+        processed = edSlack.process_json(unresolved_threads, edSlack.fields)
+        overdue_blocks = []
+
+        for _, row in processed.iterrows():
+            post_id = row.get("id")
+            title = row.get("title", "Untitled")
+            created_str = row.get("created_at")
+            url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
+
+            if not created_str or post_id in alerted_post_ids:
+                continue
+
+            created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
+            hours_passed = (now - created_time).total_seconds() / 3600
+
+            print(f"🕑 Checked post ID {post_id} | Age: {round(hours_passed, 2)}h")
+
+            if hours_passed >= ED_ALERT_HOURS:
+                overdue_blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*<{url}|{title}>*\n"
+                            f"> ⏱️ *Posted:* {created_time.strftime('%b %d at %I:%M %p')}\n"
+                            f"> ⌛ *Unanswered for:* *{round(hours_passed, 1)} hours*"
+                        )
+                    }
+                })
+                overdue_blocks.append({"type": "divider"})
+                alerted_post_ids.add(post_id)
+
+        if overdue_blocks:
+            print(f"📣 Alerting for {len(overdue_blocks) // 2} overdue Ed post(s).")
+
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🔔 Unanswered Ed Posts",
+                        "emoji": True
+                    }
+                }
+            ] + overdue_blocks + [
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"Brought to you by Seamless Learning"
+                        }
+                    ]
+                }
+            ]
+
+            app.client.chat_postMessage(channel=ALERT_CHANNEL, blocks=blocks)
+
+    except Exception as e:
+        print(f"❌ Error in check_unanswered_edposts: {e}")
+
+
 
 def main():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(check_unanswered_edposts, 'interval', minutes=1)
+    scheduler.start()
+
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
 

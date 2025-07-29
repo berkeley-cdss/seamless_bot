@@ -20,7 +20,7 @@ df = pd.read_csv(csv_file_path)
 column_names = df.columns.tolist()
 
 # Create table query
-table_name = "c88c_gradescope"
+table_name = "data100_gradescope"
 creat_table_query = f"CREATE TABLE {table_name} ("
 for column in column_names:
     creat_table_query+= f'"{column}" VARCHAR, '
