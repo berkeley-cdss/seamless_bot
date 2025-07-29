@@ -37,7 +37,7 @@ import threading
 
 
 # Edstem Tracker
-ALERT_CHANNEL = "#seamless-bot-dev"  # Replace with your real Slack channel
+ALERT_CHANNEL = "#ed"  # Replace with your real Slack channel
 ED_ALERT_HOURS = 6  # Number of hours before a post is considered overdue
 NOTIFY_HOURS = (8, 23)  # Only send pings between 08:00–23:59
 alerted_post_ids = set()  # Track already pinged Ed posts
@@ -60,7 +60,7 @@ with open("config/credentials.yml", 'r') as stream:
 
 SLACK_BOT_TOKEN=credentials['credentials']['SLACK_BOT_TOKEN']
 SLACK_APP_TOKEN=credentials['credentials']['SLACK_APP_TOKEN']
-ed_course_id = credentials["credentials"]["ED_COURSE_IDS"]["cs88staff"]
+ed_course_id = credentials["credentials"]["ED_COURSE_IDS"]["data100summer2025"]
 
 def log_command(command_name):
     def decorator(func):
@@ -706,7 +706,7 @@ def check_unanswered_edposts():
             print(f"⏰ Skipping check at {now.strftime('%H:%M')} — outside active hours.")
             return
 
-        edSlack = EdSlackAPI("data100staff")  # Replace with your team domain
+        edSlack = EdSlackAPI("data100summer2025")  # Replace with your team domain
         unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
 
         if not unresolved_threads:
@@ -714,8 +714,10 @@ def check_unanswered_edposts():
             return
 
         processed = edSlack.process_json(unresolved_threads, edSlack.fields)
-        overdue_blocks = []
+        new_alerts = 0
 
+        # Build list of overdue posts
+        overdue_posts = []
         for _, row in processed.iterrows():
             post_id = row.get("id")
             title = row.get("title", "Untitled")
@@ -728,57 +730,61 @@ def check_unanswered_edposts():
             created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
             hours_passed = (now - created_time).total_seconds() / 3600
 
-            print(f"🕑 Checked post ID {post_id} | Age: {round(hours_passed, 2)}h")
-
             if hours_passed >= ED_ALERT_HOURS:
-                overdue_blocks.append({
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": (
-                            f"*<{url}|{title}>*\n"
-                            f"> ⏱️ *Posted:* {created_time.strftime('%b %d at %I:%M %p')}\n"
-                            f"> ⌛ *Unanswered for:* *{round(hours_passed, 1)} hours*"
-                        )
-                    }
+                overdue_posts.append({
+                    "post_id": post_id,
+                    "title": title,
+                    "url": url,
+                    "created_time": created_time,
+                    "hours_passed": hours_passed
                 })
-                overdue_blocks.append({"type": "divider"})
-                alerted_post_ids.add(post_id)
 
-        if overdue_blocks:
-            print(f"📣 Alerting for {len(overdue_blocks) // 2} overdue Ed post(s).")
+        if not overdue_posts:
+            print("✅ No new overdue posts to alert.")
+            return
 
-            blocks = [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "🔔 Unanswered Ed Posts",
-                        "emoji": True
-                    }
-                }
-            ] + overdue_blocks + [
-                {
-                    "type": "context",
-                    "elements": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"Brought to you by Seamless Learning"
-                        }
-                    ]
-                }
-            ]
+        # Send header message
+        header = (
+            ":rotating_light: *Ed posts that need your attention!*\n"
+            "React with :white_check_mark: on a post below if you're answering it."
+        )
+        header_response = app.client.chat_postMessage(
+            channel=ALERT_CHANNEL,
+            text=header,
+            unfurl_links=False,
+            unfurl_media=False
+        )
+        thread_ts = header_response["ts"] if header_response.get("ok") else None
 
-            app.client.chat_postMessage(channel=ALERT_CHANNEL, blocks=blocks)
+        # Send each post as lightweight message
+        for post in overdue_posts:
+            message = (
+                f"<{post['url']}|*{post['title']}*> - ⌛ Unanswered for *{round(post['hours_passed'], 1)}h*, "
+                f"posted {post['created_time'].strftime('%b %d, %I:%M%p')}."
+            )
+
+            response = app.client.chat_postMessage(
+                channel=ALERT_CHANNEL,
+                text=message,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False
+            )
+
+            if response.get("ok"):
+                alerted_post_ids.add(post["post_id"])
+                new_alerts += 1
+            else:
+                print(f"⚠️ Failed to post message for post ID {post['post_id']}")
+
+        print(f"📣 Alerted for {new_alerts} overdue Ed post(s).")
 
     except Exception as e:
         print(f"❌ Error in check_unanswered_edposts: {e}")
 
-
-
 def main():
     scheduler = BackgroundScheduler()
-    scheduler.add_job(check_unanswered_edposts, 'interval', minutes=30)
+    scheduler.add_job(check_unanswered_edposts, 'interval', minutes=60)
     scheduler.start()
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
