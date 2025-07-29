@@ -38,7 +38,7 @@ import threading
 
 # Edstem Tracker
 ALERT_CHANNEL = "#seamless-bot-dev"  # Replace with your real Slack channel
-ED_ALERT_HOURS = 1  # Number of hours before a post is considered overdue
+ED_ALERT_HOURS = 6  # Number of hours before a post is considered overdue
 NOTIFY_HOURS = (8, 23)  # Only send pings between 08:00–23:59
 alerted_post_ids = set()  # Track already pinged Ed posts
 
@@ -778,7 +778,7 @@ def check_unanswered_edposts():
 
 def main():
     scheduler = BackgroundScheduler()
-    scheduler.add_job(check_unanswered_edposts, 'interval', minutes=1)
+    scheduler.add_job(check_unanswered_edposts, 'interval', minutes=30)
     scheduler.start()
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
