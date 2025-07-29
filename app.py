@@ -714,10 +714,8 @@ def check_unanswered_edposts():
             return
 
         processed = edSlack.process_json(unresolved_threads, edSlack.fields)
-        new_alerts = 0
-
-        # Build list of overdue posts
         overdue_posts = []
+
         for _, row in processed.iterrows():
             post_id = row.get("id")
             title = row.get("title", "Untitled")
@@ -735,34 +733,32 @@ def check_unanswered_edposts():
                     "post_id": post_id,
                     "title": title,
                     "url": url,
-                    "created_time": created_time,
-                    "hours_passed": hours_passed
+                    "days_unanswered": round(hours_passed / 24, 1)
                 })
 
         if not overdue_posts:
             print("✅ No new overdue posts to alert.")
             return
 
-        # Send header message
-        header = (
+        # Sort from longest unanswered to shortest
+        overdue_posts.sort(key=lambda x: x["days_unanswered"], reverse=True)
+
+        # Header message
+        header_text = (
             ":rotating_light: *Ed posts that need your attention!*\n"
-            "React with :white_check_mark: on a post below if you're answering it."
+            "React with :white_check_mark: below if you're answering it."
         )
         header_response = app.client.chat_postMessage(
             channel=ALERT_CHANNEL,
-            text=header,
+            text=header_text,
             unfurl_links=False,
             unfurl_media=False
         )
         thread_ts = header_response["ts"] if header_response.get("ok") else None
 
-        # Send each post as lightweight message
+        new_alerts = 0
         for post in overdue_posts:
-            message = (
-                f"<{post['url']}|*{post['title']}*> - ⌛ Unanswered for *{round(post['hours_passed'], 1)}h*, "
-                f"posted {post['created_time'].strftime('%b %d, %I:%M%p')}."
-            )
-
+            message = f"<{post['url']}|*{post['title']}*> - *{post['days_unanswered']}d*"
             response = app.client.chat_postMessage(
                 channel=ALERT_CHANNEL,
                 text=message,
@@ -781,6 +777,7 @@ def check_unanswered_edposts():
 
     except Exception as e:
         print(f"❌ Error in check_unanswered_edposts: {e}")
+
 
 def main():
     scheduler = BackgroundScheduler()
