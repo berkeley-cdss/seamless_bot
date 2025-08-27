@@ -31,6 +31,7 @@ from bcourses import CanvasClient
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timedelta
 import pytz
 import threading
@@ -38,9 +39,7 @@ import threading
 
 # Edstem Tracker
 ALERT_CHANNEL = "#ed"  # Replace with your real Slack channel
-ED_ALERT_HOURS = 6  # Number of hours before a post is considered overdue
 NOTIFY_HOURS = (8, 23)  # Only send pings between 08:00–23:59
-alerted_post_ids = set()  # Track already pinged Ed posts
 
 # Google Sheets API
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -60,7 +59,7 @@ with open("config/credentials.yml", 'r') as stream:
 
 SLACK_BOT_TOKEN=credentials['credentials']['SLACK_BOT_TOKEN']
 SLACK_APP_TOKEN=credentials['credentials']['SLACK_APP_TOKEN']
-ed_course_id = credentials["credentials"]["ED_COURSE_IDS"]["data100summer2025"]
+ed_course_id = credentials["credentials"]["ED_COURSE_IDS"]["data100fall2025"]
 
 def log_command(command_name):
     def decorator(func):
@@ -702,16 +701,19 @@ def generate_student_radar_plot(student_name, df, lab_df=None, ed_df=None):
 def check_unanswered_edposts():
     try:
         now = datetime.now(pytz.timezone("America/Los_Angeles"))
+        
+        # Only run Monday–Friday
+        if now.weekday() >= 5:
+            print(f"📆 Skipping check at {now.strftime('%A %H:%M')} - weekend.")
+            return
+
+        # Only run during active hours
         if not (NOTIFY_HOURS[0] <= now.hour <= NOTIFY_HOURS[1]):
-            print(f"⏰ Skipping check at {now.strftime('%H:%M')} — outside active hours.")
+            print(f"⏰ Skipping check at {now.strftime('%H:%M')} - outside active hours.")
             return
 
-        edSlack = EdSlackAPI("data100summer2025")  # Replace with your team domain
+        edSlack = EdSlackAPI("data100fall2025")  # Replace with your actual team domain
         unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
-
-        if not unresolved_threads:
-            print("✅ No unresolved Ed posts found.")
-            return
 
         processed = edSlack.process_json(unresolved_threads, edSlack.fields)
         overdue_posts = []
@@ -722,44 +724,47 @@ def check_unanswered_edposts():
             created_str = row.get("created_at")
             url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
 
-            if not created_str or post_id in alerted_post_ids:
+            if not created_str:
                 continue
 
             created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
             hours_passed = (now - created_time).total_seconds() / 3600
 
-            if hours_passed >= ED_ALERT_HOURS:
-                overdue_posts.append({
-                    "post_id": post_id,
-                    "title": title,
-                    "url": url,
-                    "days_unanswered": round(hours_passed / 24, 1)
-                })
+            overdue_posts.append({
+                "post_id": post_id,
+                "title": title,
+                "url": url,
+                "days_unanswered": round(hours_passed / 24, 2)
+            })
 
-        if not overdue_posts:
-            print("✅ No new overdue posts to alert.")
-            return
-
-        # Sort from longest unanswered to shortest
         overdue_posts.sort(key=lambda x: x["days_unanswered"], reverse=True)
 
-        # Header message
-        header_text = (
-            ":rotating_light: *Ed posts that need your attention!*\n"
-            "React with :white_check_mark: below if you're answering it."
-        )
+        if overdue_posts:
+            header_message = (
+                ":rotating_light: *Unanswered Ed Posts That Need Attention!*\n"
+                "React with :white_check_mark: when resolving a thread."
+            )
+        else:
+            header_message = (
+                ":white_check_mark: All Ed posts have been responded to. "
+                "Nothing to do for now. Great job team!"
+            )
+
         header_response = app.client.chat_postMessage(
             channel=ALERT_CHANNEL,
-            text=header_text,
-            unfurl_links=False,
-            unfurl_media=False
+            text=header_message
         )
-        thread_ts = header_response["ts"] if header_response.get("ok") else None
+        thread_ts = header_response["ts"]
 
-        new_alerts = 0
+        if not overdue_posts:
+            print("✅ All posts resolved - no alerts to send.")
+            return
+
+        print(f"📣 Alerting for {len(overdue_posts)} Ed post(s).")
+
         for post in overdue_posts:
-            message = f"<{post['url']}|*{post['title']}*> - *{post['days_unanswered']}d*"
-            response = app.client.chat_postMessage(
+            message = f"<{post['url']}|{post['title']}> — {post['days_unanswered']}d unanswered"
+            app.client.chat_postMessage(
                 channel=ALERT_CHANNEL,
                 text=message,
                 thread_ts=thread_ts,
@@ -767,21 +772,19 @@ def check_unanswered_edposts():
                 unfurl_media=False
             )
 
-            if response.get("ok"):
-                alerted_post_ids.add(post["post_id"])
-                new_alerts += 1
-            else:
-                print(f"⚠️ Failed to post message for post ID {post['post_id']}")
-
-        print(f"📣 Alerted for {new_alerts} overdue Ed post(s).")
-
     except Exception as e:
-        print(f"❌ Error in check_unanswered_edposts: {e}")
+        print(f"❌ Error checking Ed posts: {e}")
 
 
 def main():
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(check_unanswered_edposts, 'interval', minutes=60)
+    scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
+    # Run Ed post alert check at 9am, 1pm, and 5pm Pacific Time
+    scheduler.add_job(
+        check_unanswered_edposts,
+        trigger='cron',
+        hour='9,13,17',
+        minute=0
+    )
     scheduler.start()
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
