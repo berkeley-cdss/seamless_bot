@@ -701,7 +701,7 @@ def generate_student_radar_plot(student_name, df, lab_df=None, ed_df=None):
 def check_unanswered_edposts():
     try:
         now = datetime.now(pytz.timezone("America/Los_Angeles"))
-        
+
         # Only run Monday–Friday
         if now.weekday() >= 5:
             print(f"📆 Skipping check at {now.strftime('%A %H:%M')} - weekend.")
@@ -729,16 +729,34 @@ def check_unanswered_edposts():
 
             created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
             hours_passed = (now - created_time).total_seconds() / 3600
+            days = int(hours_passed // 24)
+            hours = int(hours_passed % 24)
+            minutes = int((hours_passed * 60) % 60)
+
+            # Format time string
+            if days >= 1 and hours >= 1:
+                time_str = f"{days}d {hours}h unanswered"
+            elif days >= 1:
+                time_str = f"{days}d unanswered"
+            elif hours >= 1:
+                time_str = f"{hours}h unanswered"
+            else:
+                time_str = f"{minutes}m unanswered"
 
             overdue_posts.append({
                 "post_id": post_id,
                 "title": title,
                 "url": url,
-                "days_unanswered": round(hours_passed / 24, 2)
+                "time_str": time_str
             })
 
-        overdue_posts.sort(key=lambda x: x["days_unanswered"], reverse=True)
+        # Sort from oldest to newest
+        overdue_posts.sort(
+            key=lambda post: (int(post["time_str"].split()[0].rstrip("dhm")), post["time_str"]),
+            reverse=True
+        )
 
+        # Send Slack message
         if overdue_posts:
             header_message = (
                 ":rotating_light: *Unanswered Ed Posts That Need Attention!*\n"
@@ -763,7 +781,7 @@ def check_unanswered_edposts():
         print(f"📣 Alerting for {len(overdue_posts)} Ed post(s).")
 
         for post in overdue_posts:
-            message = f"<{post['url']}|{post['title']}> — {post['days_unanswered']}d unanswered"
+            message = f"<{post['url']}|{post['title']}> — {post['time_str']}"
             app.client.chat_postMessage(
                 channel=ALERT_CHANNEL,
                 text=message,
@@ -774,7 +792,6 @@ def check_unanswered_edposts():
 
     except Exception as e:
         print(f"❌ Error checking Ed posts: {e}")
-
 
 def main():
     scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
