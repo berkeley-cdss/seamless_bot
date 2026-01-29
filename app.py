@@ -57,9 +57,21 @@ with open("config/credentials.yml", 'r') as stream:
     except yaml.YAMLError as exc:
         print(exc)
 
-SLACK_BOT_TOKEN=credentials['credentials']['SLACK_BOT_TOKEN']
-SLACK_APP_TOKEN=credentials['credentials']['SLACK_APP_TOKEN']
-ed_course_id = credentials["credentials"]["ED_COURSE_IDS"]["data100fall2025"]
+# Per-workspace Slack: built from credentials.courses.<key>.slack
+SLACK_WORKSPACES = {
+    k: v.get("slack", {}) for k, v in COURSES.items() if v.get("slack")
+}
+
+# Populated in main(): team_domain -> Bolt App (used by scheduler to post per-workspace)
+slack_app_by_team = {}
+
+
+def _get_course_config_for_command(command: dict) -> dict:
+    """
+    Helper to resolve per-course configuration based on the Slack team_domain.
+    """
+    team_domain = command.get("team_domain")
+    return get_course_config(team_domain)
 
 def log_command(command_name):
     def decorator(func):
@@ -85,522 +97,525 @@ def log_command(command_name):
         return wrapper
     return decorator
 
-app = App(token=SLACK_BOT_TOKEN, name="test-bot")
+def register_handlers(app):
+    @app.event("app_mention")
+    def event_test(event, say):
+        print(f"Received event: {event}")  # Debugging log
+        say("Hi there!")
 
+    @app.command("/current_unresolved")
+    @log_command("/current_unresolved")
+    def unresolved_info(ack, say, command):
+        ack()
+        edSlack = EdSlackAPI(command["team_domain"])
 
-@app.event("app_mention")
-def event_test(event, say):
-    print(f"Received event: {event}")  # Debugging log
-    say("Hi there!")
+        try:
+            course_config = _get_course_config_for_command(command)
+            ed_course_id = course_config["edstem"]["ED_COURSE_ID"]
 
+            unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
 
-@app.command("/current_unresolved")
-@log_command("/current_unresolved")
-def unresolved_info(ack, say, command):
-    ack()
-    edSlack = EdSlackAPI(command["team_domain"])
-
-    try:
-        unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
-
-        if not unresolved_threads:
-            say("✅ No unresolved threads found!")
-            return
-
-        processed_unresolved = edSlack.add_subthreads(
-            edSlack.process_user(edSlack.process_json(unresolved_threads, edSlack.fields))
-        )
-        lines = []
-        for _, row in processed_unresolved.head(5).iterrows():
-            title = row.get("title", "Untitled")
-            post_id = row.get("id", "")
-            link = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
-            lines.append(f"• <{link}|{title}>")
-
-        response = f"Hi {command['user_name']}! We have {len(processed_unresolved)} unresolved thread(s):\n" + "\n".join(lines)
-        if len(processed_unresolved) > 5:
-            response += f"\n...and {len(processed_unresolved) - 5} more."
-
-        say(response)
-
-    except Exception as e:
-        print(f"❌ Error in /current_unresolved: {e}")
-        say(f"❌ Error processing unresolved threads: {e}")
-
-
-@app.command("/top_questions")
-def top_questions(ack, say, command):
-    ack()
-    edSlack = EdSlackAPI(command['team_domain'])
-    date = command["text"]
-    month, day, year = date.split("/")
-    up_to = datetime(int(year), int(month), int(day))
-    upto_threads = edSlack.process_user(edSlack.get_timeframe(up_to))
-    upto_questions = upto_threads[upto_threads["type"] == "question"]
-    response = f"Hi {command['user_name']}! Here are the top question categories after {date}:\n" + str(upto_questions["category"].value_counts()[:5])
-    say(response)
-
-@app.command("/get_extension")
-def get_extension(ack, say, command):
-    ack()
-    assignment = command["text"].strip()  # Remove extra spaces
-    print(f"🔍 Checking extension for: '{assignment}'")
-
-    try:
-        GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=COURSE_ID)
-        assignment_list = GC.get_assignments()  # Get all assignments
-        print(f"📌 Available assignments: {list(assignment_list.keys())}")  # Debugging
-        # Try different variations of input (spaces, underscores)
-        if assignment not in assignment_list:
-            # Try normalizing the input
-            normalized_assignment = assignment.replace("_", " ")  # Convert "Lab4" -> "Lab 4"
-            if normalized_assignment in assignment_list:
-                assignment = normalized_assignment
-            else:
-                say(f"⚠️ Assignment '{assignment}' not found! Available assignments: {', '.join(assignment_list.keys())}")
+            if not unresolved_threads:
+                say("✅ No unresolved threads found!")
                 return
 
-        df = GC.get_extensions(assignment)
-        df_str = df.to_string()
-        response = f"Hi {command['user_name']}! Here are the extension details for {assignment}:\n{df_str}"
-        say(response)
-    except KeyError as e:
-        say(f"⚠️ Error: {e}")
-    except Exception as e:
-        print(f"❌ Error in /get_extension: {e}")
-        say(f"An error occurred: {e}")
+            processed_unresolved = edSlack.add_subthreads(
+                edSlack.process_user(edSlack.process_json(unresolved_threads, edSlack.fields))
+            )
+            lines = []
+            for _, row in processed_unresolved.head(5).iterrows():
+                title = row.get("title", "Untitled")
+                post_id = row.get("id", "")
+                link = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
+                lines.append(f"• <{link}|{title}>")
 
+            response = f"Hi {command['user_name']}! We have {len(processed_unresolved)} unresolved thread(s):\n" + "\n".join(lines)
+            if len(processed_unresolved) > 5:
+                response += f"\n...and {len(processed_unresolved) - 5} more."
 
+            say(response)
 
-@app.command("/get_user_id")
-def get_user_id(ack, say, command):
-    ack()
-    say("🔍 Fetching user ID... Please wait.")
-    input_text = command["text"]
-    parsed_values = input_text.split(",")
+        except Exception as e:
+            print(f"❌ Error in /current_unresolved: {e}")
+            say(f"❌ Error processing unresolved threads: {e}")
 
-    if len(parsed_values) != 3:
-        say(f"⚠️ Invalid input format. Use: `/get_user_id Name,Email,SID`")
-        return
-
-    Name, email, SID = parsed_values
-
-    GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=COURSE_ID)
-
-    if Name.lower() == 'none' and email.lower() == 'none' and SID.lower() == 'none':
-        df = GC.get_student_id(None, None, None)
-        response = f"Hi {command['user_name']}! Here are the Gradescope user ID details for course {COURSE_ID}:\n{df}"
-    else:
-        id = None
-        if Name.lower() != 'none':
-            id = GC.get_student_id(Name, None, None)
-        elif email.lower() != 'none':
-            id = GC.get_student_id(None, email, None)
-        elif SID.lower() != 'none':
-            id = GC.get_student_id(None, None, SID)
-
-        if "Error" in id:
-            response = f"⚠️ {id}"
-        else:
-            response = f"Hi {command['user_name']}! Here is the Gradescope user ID for {Name or email or SID}:\n{id}"
-
-    say(response)
-
-
-@app.command("/get_user_info")
-def get_user_info(ack, say, command):
-    ack()
-    say(":mag: Fetching student info... Please wait.")
-
-    input_text = command["text"].strip()
-
-    # Ensure input is provided
-    if not input_text:
-        say("⚠️ Please provide a name, email, or SID. Example: `/get_user_info John Doe`")
-        return
-
-    # Connect to Gradescope API
-    GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=COURSE_ID)
-
-    try:
-        # Assume get_student_id exists and returns a DataFrame
-        student_info = None
-        
-        if "@" in input_text:  # Input is an email
-            student_info = GC.get_student_id(None, input_text, None)
-        elif input_text.isdigit():  # Input is a student ID (SID)
-            student_info = GC.get_student_id(None, None, input_text)
-        else:  # Assume it's a name
-            student_info = GC.get_student_id(input_text, None, None)
-
-        # Check if any student info was found
-        if student_info is None or isinstance(student_info, str):
-            say(f"⚠️ No student found matching `{input_text}`.")
-            return
-
-        # Extract student information
-        response = f"✅ Student Info for `{input_text}`:\n"
-        if isinstance(student_info, pd.DataFrame) and not student_info.empty:
-            for _, row in student_info.iterrows():
-                response += f"👤 Name: {row.get('Name', 'N/A')}\n📧 Email: {row.get('Email', 'N/A')}\n🆔 SID: {row.get('SID', 'N/A')}\n\n"
-        else:
-            response += "⚠️ No matching student found."
-
-        say(response)
-
-    except Exception as e:
-        print(f"❌ Error in /get_user_info: {e}")
-        say(f"⚠️ Error fetching student info: {e}")
-
-
-@app.command("/get_student_performance")
-def get_student_performance(ack, say, command):
-    ack()
-    name = command["text"]
-    GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id = COURSE_ID)
-
-    result = GC.get_student_performance(name)
-    response = f"Hi {command['user_name']}! Here are the approximate performance for REDACTED\n{result}"
-    # print(response)
-    say(response)
-
-@app.command("/refresh_gradescope")
-def get_student_performance(ack, say, command):
-    global cached_performance_df
-    ack()
-    GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id = COURSE_ID)
-
-    GC.update_performance_data()
-    response = f"Hi {command['user_name']}! Gradescope Data Had Updated Successfully!"
-    # print(response)
-    say(response)
-
-@app.command("/plot_questions")
-def plot_questions(ack, say, command, client):
-    ack()
-    say(":bar_chart: Generating a plot of student questions...")
-
-    try:
+    @app.command("/top_questions")
+    def top_questions(ack, say, command):
+        ack()
         edSlack = EdSlackAPI(command['team_domain'])
-        input_text = command["text"].strip().lower()
+        date = command["text"]
+        month, day, year = date.split("/")
+        up_to = datetime(int(year), int(month), int(day))
+        upto_threads = edSlack.process_user(edSlack.get_timeframe(up_to))
+        upto_questions = upto_threads[upto_threads["type"] == "question"]
+        response = f"Hi {command['user_name']}! Here are the top question categories after {date}:\n" + str(upto_questions["category"].value_counts()[:5])
+        say(response)
 
-        # Determine date range
-        if input_text == "last week":
-            start_date = datetime.now() - timedelta(days=7)
-        elif input_text == "last month":
-            start_date = datetime.now() - timedelta(days=30)
+    @app.command("/get_extension")
+    def get_extension(ack, say, command):
+        ack()
+        assignment = command["text"].strip()  # Remove extra spaces
+        print(f"🔍 Checking extension for: '{assignment}'")
+
+        try:
+            course_config = _get_course_config_for_command(command)
+            course_id = course_config.get("gradescope_id") or COURSE_ID
+            GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=course_id)
+            assignment_list = GC.get_assignments()  # Get all assignments
+            print(f"📌 Available assignments: {list(assignment_list.keys())}")  # Debugging
+            # Try different variations of input (spaces, underscores)
+            if assignment not in assignment_list:
+                # Try normalizing the input
+                normalized_assignment = assignment.replace("_", " ")  # Convert "Lab4" -> "Lab 4"
+                if normalized_assignment in assignment_list:
+                    assignment = normalized_assignment
+                else:
+                    say(f"⚠️ Assignment '{assignment}' not found! Available assignments: {', '.join(assignment_list.keys())}")
+                    return
+
+            df = GC.get_extensions(assignment)
+            df_str = df.to_string()
+            response = f"Hi {command['user_name']}! Here are the extension details for {assignment}:\n{df_str}"
+            say(response)
+        except KeyError as e:
+            say(f"⚠️ Error: {e}")
+        except Exception as e:
+            print(f"❌ Error in /get_extension: {e}")
+            say(f"An error occurred: {e}")
+
+    @app.command("/get_user_id")
+    def get_user_id(ack, say, command):
+        ack()
+        say("🔍 Fetching user ID... Please wait.")
+        input_text = command["text"]
+        parsed_values = input_text.split(",")
+
+        if len(parsed_values) != 3:
+            say(f"⚠️ Invalid input format. Use: `/get_user_id Name,Email,SID`")
+            return
+
+        Name, email, SID = parsed_values
+
+        course_config = _get_course_config_for_command(command)
+        course_id = course_config.get("gradescope_id") or COURSE_ID
+        GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=course_id)
+
+        if Name.lower() == 'none' and email.lower() == 'none' and SID.lower() == 'none':
+            df = GC.get_student_id(None, None, None)
+            response = f"Hi {command['user_name']}! Here are the Gradescope user ID details for course {course_id}:\n{df}"
         else:
-            try:
-                month, day, year = input_text.split("/")
-                start_date = datetime(int(year), int(month), int(day))
-            except ValueError:
-                say("⚠️ Invalid date format. Use MM/DD/YYYY, 'last week', or 'last month'.")
+            id = None
+            if Name.lower() != 'none':
+                id = GC.get_student_id(Name, None, None)
+            elif email.lower() != 'none':
+                id = GC.get_student_id(None, email, None)
+            elif SID.lower() != 'none':
+                id = GC.get_student_id(None, None, SID)
+
+            if "Error" in id:
+                response = f"⚠️ {id}"
+            else:
+                response = f"Hi {command['user_name']}! Here is the Gradescope user ID for {Name or email or SID}:\n{id}"
+
+        say(response)
+
+    @app.command("/get_user_info")
+    def get_user_info(ack, say, command):
+        ack()
+        say(":mag: Fetching student info... Please wait.")
+
+        input_text = command["text"].strip()
+
+        # Ensure input is provided
+        if not input_text:
+            say("⚠️ Please provide a name, email, or SID. Example: `/get_user_info John Doe`")
+            return
+
+        # Connect to Gradescope API
+        course_config = _get_course_config_for_command(command)
+        course_id = course_config.get("gradescope_id") or COURSE_ID
+        GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=course_id)
+
+        try:
+            # Assume get_student_id exists and returns a DataFrame
+            student_info = None
+
+            if "@" in input_text:  # Input is an email
+                student_info = GC.get_student_id(None, input_text, None)
+            elif input_text.isdigit():  # Input is a student ID (SID)
+                student_info = GC.get_student_id(None, None, input_text)
+            else:  # Assume it's a name
+                student_info = GC.get_student_id(input_text, None, None)
+
+            # Check if any student info was found
+            if student_info is None or isinstance(student_info, str):
+                say(f"⚠️ No student found matching `{input_text}`.")
                 return
 
-        # Fetch and filter student questions
-        threads = edSlack.process_user(edSlack.get_timeframe(start_date))
-        questions = threads[threads["type"] == "question"]
+            # Extract student information
+            response = f"✅ Student Info for `{input_text}`:\n"
+            if isinstance(student_info, pd.DataFrame) and not student_info.empty:
+                for _, row in student_info.iterrows():
+                    response += f"👤 Name: {row.get('Name', 'N/A')}\n📧 Email: {row.get('Email', 'N/A')}\n🆔 SID: {row.get('SID', 'N/A')}\n\n"
+            else:
+                response += "⚠️ No matching student found."
 
-        # Check if data is available
-        if questions.empty:
-            say(f"⚠️ No student questions found since {start_date.strftime('%m/%d/%Y')}.")
-            return
+            say(response)
 
-        # Ensure 'created_at' column exists
-        if "created_at" not in questions.columns:
-            say(f"⚠️ Error: 'created_at' column not found! Available columns: {', '.join(questions.columns)}")
-            return
+        except Exception as e:
+            print(f"❌ Error in /get_user_info: {e}")
+            say(f"⚠️ Error fetching student info: {e}")
 
-        # Convert 'created_at' to datetime
-        questions.loc[:, "created_at"] = pd.to_datetime(questions["created_at"])
+    @app.command("/get_student_performance")
+    def get_student_performance(ack, say, command):
+        ack()
+        name = command["text"]
+        course_config = _get_course_config_for_command(command)
+        course_id = course_config.get("gradescope_id") or COURSE_ID
+        GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=course_id)
 
-        # Count questions per day
-        question_counts = questions.resample("D", on="created_at").size()
+        result = GC.get_student_performance(name)
+        response = f"Hi {command['user_name']}! Here are the approximate performance for REDACTED\n{result}"
+        say(response)
 
-        # Generate the plot
-        plt.figure(figsize=(10, 5))
-        plt.plot(question_counts.index, question_counts.values, marker="o", linestyle="-", label="Student Questions")
-        plt.xlabel("Date")
-        plt.ylabel("Number of Questions")
-        plt.title(f"Student Questions from {start_date.strftime('%m/%d/%Y')} to Today")
-        plt.xticks(rotation=45)
-        plt.legend()
-        plt.grid(True)
+    @app.command("/refresh_gradescope")
+    def refresh_gradescope(ack, say, command):
+        global cached_performance_df
+        ack()
+        course_config = _get_course_config_for_command(command)
+        course_id = course_config.get("gradescope_id") or COURSE_ID
+        GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=course_id)
 
-        # Save plot to a buffer
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-        buf.seek(0)
+        GC.update_performance_data()
+        response = f"Hi {command['user_name']}! Gradescope Data Had Updated Successfully!"
+        say(response)
 
-        # Upload plot to Slack
-        response = client.files_upload_v2(
-            channel=command["channel_id"],
-            file=buf,
-            filename="questions_plot.png",
-            title=f"Student Questions from {start_date.strftime('%m/%d/%Y')} to Today"
-        )
+    @app.command("/plot_questions")
+    def plot_questions(ack, say, command, client):
+        ack()
+        say(":bar_chart: Generating a plot of student questions...")
 
-        # Confirm success
-        if response["ok"]:
-            say(f"✅ Here is the student questions plot from {start_date.strftime('%m/%d/%Y')} to today.")
-        else:
-            say("⚠️ Failed to upload the plot.")
+        try:
+            edSlack = EdSlackAPI(command['team_domain'])
+            input_text = command["text"].strip().lower()
 
-    except Exception as e:
-        print(f"❌ Error in /plot_questions: {e}")
-        say(f"⚠️ Error generating plot: {e}")
+            # Determine date range
+            if input_text == "last week":
+                start_date = datetime.now() - timedelta(days=7)
+            elif input_text == "last month":
+                start_date = datetime.now() - timedelta(days=30)
+            else:
+                try:
+                    month, day, year = input_text.split("/")
+                    start_date = datetime(int(year), int(month), int(day))
+                except ValueError:
+                    say("⚠️ Invalid date format. Use MM/DD/YYYY, 'last week', or 'last month'.")
+                    return
 
-@app.command("/lab_attendance")
-def lab_attendance(ack, say, command):
-    ack()
-    input_name = command["text"].strip().lower()
+            # Fetch and filter student questions
+            threads = edSlack.process_user(edSlack.get_timeframe(start_date))
+            questions = threads[threads["type"] == "question"]
 
-    try:
-        # Load attendance sheet from Google Sheets
+            # Check if data is available
+            if questions.empty:
+                say(f"⚠️ No student questions found since {start_date.strftime('%m/%d/%Y')}.")
+                return
+
+            # Ensure 'created_at' column exists
+            if "created_at" not in questions.columns:
+                say(f"⚠️ Error: 'created_at' column not found! Available columns: {', '.join(questions.columns)}")
+                return
+
+            # Convert 'created_at' to datetime
+            questions.loc[:, "created_at"] = pd.to_datetime(questions["created_at"])
+
+            # Count questions per day
+            question_counts = questions.resample("D", on="created_at").size()
+
+            # Generate the plot
+            plt.figure(figsize=(10, 5))
+            plt.plot(question_counts.index, question_counts.values, marker="o", linestyle="-", label="Student Questions")
+            plt.xlabel("Date")
+            plt.ylabel("Number of Questions")
+            plt.title(f"Student Questions from {start_date.strftime('%m/%d/%Y')} to Today")
+            plt.xticks(rotation=45)
+            plt.legend()
+            plt.grid(True)
+
+            # Save plot to a buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", bbox_inches="tight")
+            buf.seek(0)
+
+            # Upload plot to Slack
+            response = client.files_upload_v2(
+                channel=command["channel_id"],
+                file=buf,
+                filename="questions_plot.png",
+                title=f"Student Questions from {start_date.strftime('%m/%d/%Y')} to Today"
+            )
+
+            # Confirm success
+            if response["ok"]:
+                say(f"✅ Here is the student questions plot from {start_date.strftime('%m/%d/%Y')} to today.")
+            else:
+                say("⚠️ Failed to upload the plot.")
+
+        except Exception as e:
+            print(f"❌ Error in /plot_questions: {e}")
+            say(f"⚠️ Error generating plot: {e}")
+
+    @app.command("/lab_attendance")
+    def lab_attendance(ack, say, command):
+        ack()
+        input_name = command["text"].strip().lower()
+
+        try:
+            # Load attendance sheet from Google Sheets
+            creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+            service = build('sheets', 'v4', credentials=creds)
+            result = service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID, range='Form Responses 1!A1:G'
+            ).execute()
+            rows = result.get("values", [])
+            df = pd.DataFrame(rows[1:], columns=rows[0])
+
+            # Combine First + Last Name for comparison
+            df["Full Name"] = (df["First Name"].str.strip() + " " + df["Last Name"].str.strip()).str.lower()
+
+            # Match student by full name (case insensitive)
+            matched = df[df["Full Name"].str.contains(input_name)]
+
+            if matched.empty:
+                say(f"⚠️ Couldn't find attendance info for '{input_name}'")
+                return
+            elif len(matched["Full Name"].unique()) > 1:
+                options = ", ".join(matched['Full Name'].unique()[:5])  # just in case there are too many
+                say(f"⚠️ Found multiple matches: {options}. Be more specific.")
+                return
+
+            student_name = matched["Full Name"].iloc[0].title()
+            attendance_count = matched.shape[0]
+            say(f"✅ {student_name} has attended {attendance_count} lab(s).")
+
+        except Exception as e:
+            say(f"❌ Error accessing attendance: {e}")
+
+    @app.command("/extensions_count")
+    def extensions_count(ack, say, command):
+        ack()
+        query = command["text"].strip().lower()
+
+        say(f"🔍 Fetching extension request count for: `{query}`...")
+
+        try:
+            creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+            service = build('sheets', 'v4', credentials=creds)
+            result = service.spreadsheets().values().get(
+                spreadsheetId=EXTENSIONS_ID, range=EXTENSIONS_RANGE
+            ).execute()
+            rows = result.get("values", [])
+            if not rows:
+                say("⚠️ No extension data found.")
+                return
+            df = pd.DataFrame(rows[1:], columns=rows[0])
+            df.columns = df.columns.str.strip()  # Clean up any spacing
+
+            match = df[
+                df["Email Address"].str.lower().str.contains(query) |
+                df["Student ID Number"].str.lower().str.contains(query)
+            ]
+            count = match.shape[0]
+            if count == 0:
+                say(f"❌ No extension requests found for `{query}`.")
+            else:
+                say(f"📬 `{query}` has submitted {count} extension request(s).")
+
+        except Exception as e:
+            print(f"❌ Error in /extensions_count: {e}")
+            say(f"❌ Error accessing extension data: {e}")
+
+    @app.command("/plot_attendance")
+    def plot_attendance(ack, say, command, client):
+        ack()
+        say(":bar_chart: Generating attendance plot by section...")
+
+        try:
+            # Load attendance sheet from Google Sheets
+            creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+            service = build('sheets', 'v4', credentials=creds)
+            result = service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID, range='Form Responses 1!A1:G'
+            ).execute()
+            rows = result.get("values", [])
+            df = pd.DataFrame(rows[1:], columns=rows[0])
+
+            # Parse timestamps
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+            df['Week'] = df['Timestamp'].dt.to_period("W").apply(lambda r: r.start_time)
+
+            # Count attendance per section per week
+            attendance_summary = df.groupby(['Week', 'Section']).size().unstack(fill_value=0)
+
+            # Plot
+            plt.figure(figsize=(12, 6))
+            for section in attendance_summary.columns:
+                plt.plot(attendance_summary.index, attendance_summary[section], marker='o', label=section)
+
+            plt.xlabel("Week")
+            plt.ylabel("Attendance Count")
+            plt.title("Weekly Attendance by Section")
+            plt.xticks(rotation=45)
+            plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+            plt.tight_layout()
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            buf.seek(0)
+
+            response = client.files_upload_v2(
+                channel=command["channel_id"],
+                file=buf,
+                filename="attendance_by_section.png",
+                title="Weekly Attendance by Section"
+            )
+
+            if response["ok"]:
+                say("✅ Here is the attendance plot by section!")
+            else:
+                say("⚠️ Failed to upload the attendance plot.")
+
+        except Exception as e:
+            print(f"❌ Error in /plot_attendance: {e}")
+            say(f"❌ Error generating attendance plot: {e}")
+
+    @app.command("/plot_extensions")
+    @log_command("/plot_extensions")
+    def plot_extensions(ack, say, command, client):
         creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
         service = build('sheets', 'v4', credentials=creds)
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID, range='Form Responses 1!A1:G'
-        ).execute()
-        rows = result.get("values", [])
-        df = pd.DataFrame(rows[1:], columns=rows[0])
 
-        # Combine First + Last Name for comparison
-        df["Full Name"] = (df["First Name"].str.strip() + " " + df["Last Name"].str.strip()).str.lower()
-
-        # Match student by full name (case insensitive)
-        matched = df[df["Full Name"].str.contains(input_name)]
-
-        if matched.empty:
-            say(f"⚠️ Couldn't find attendance info for '{input_name}'")
-            return
-        elif len(matched["Full Name"].unique()) > 1:
-            options = ", ".join(matched['Full Name'].unique()[:5])  # just in case there are too many
-            say(f"⚠️ Found multiple matches: {options}. Be more specific.")
-            return
-
-        student_name = matched["Full Name"].iloc[0].title()
-        attendance_count = matched.shape[0]
-        say(f"✅ {student_name} has attended {attendance_count} lab(s).")
-
-    except Exception as e:
-        say(f"❌ Error accessing attendance: {e}")
-
-
-@app.command("/extensions_count")
-def extensions_count(ack, say, command):
-    ack()
-    query = command["text"].strip().lower()
-
-    say(f"🔍 Fetching extension request count for: `{query}`...")
-
-    try:
-        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
-        service = build('sheets', 'v4', credentials=creds)
         result = service.spreadsheets().values().get(
             spreadsheetId=EXTENSIONS_ID, range=EXTENSIONS_RANGE
         ).execute()
+
         rows = result.get("values", [])
         if not rows:
             say("⚠️ No extension data found.")
             return
+
         df = pd.DataFrame(rows[1:], columns=rows[0])
-        df.columns = df.columns.str.strip()  # Clean up any spacing
+        df.columns = df.columns.str.strip()
 
-        match = df[
-            df["Email Address"].str.lower().str.contains(query) |
-            df["Student ID Number"].str.lower().str.contains(query)
-        ]
-        count = match.shape[0]
-        if count == 0:
-            say(f"❌ No extension requests found for `{query}`.")
-        else:
-            say(f"📬 `{query}` has submitted {count} extension request(s).")
+        # Parse and clean timestamps
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.dropna(subset=["Timestamp"])
 
-    except Exception as e:
-        print(f"❌ Error in /extensions_count: {e}")
-        say(f"❌ Error accessing extension data: {e}")
-
-
-@app.command("/plot_attendance")
-def plot_attendance(ack, say, command, client):
-    ack()
-    say(":bar_chart: Generating attendance plot by section...")
-
-    try:
-        # Load attendance sheet from Google Sheets
-        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
-        service = build('sheets', 'v4', credentials=creds)
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID, range='Form Responses 1!A1:G'
-        ).execute()
-        rows = result.get("values", [])
-        df = pd.DataFrame(rows[1:], columns=rows[0])
-
-        # Parse timestamps
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        df['Week'] = df['Timestamp'].dt.to_period("W").apply(lambda r: r.start_time)
-
-        # Count attendance per section per week
-        attendance_summary = df.groupby(['Week', 'Section']).size().unstack(fill_value=0)
+        # Count by day
+        daily_counts = df["Timestamp"].dt.date.value_counts().sort_index()
 
         # Plot
-        plt.figure(figsize=(12, 6))
-        for section in attendance_summary.columns:
-            plt.plot(attendance_summary.index, attendance_summary[section], marker='o', label=section)
-
-        plt.xlabel("Week")
-        plt.ylabel("Attendance Count")
-        plt.title("Weekly Attendance by Section")
+        plt.figure(figsize=(10, 5))
+        plt.plot(daily_counts.index, daily_counts.values, marker="o", linestyle="-")
         plt.xticks(rotation=45)
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-        plt.tight_layout()
+        plt.title("Daily Extension Requests")
+        plt.xlabel("Date")
+        plt.ylabel("Number of Requests")
+        plt.grid(True)
 
+        # Save to buffer
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.savefig(buf, format="png", bbox_inches="tight")
         buf.seek(0)
 
+        # Upload to Slack
         response = client.files_upload_v2(
             channel=command["channel_id"],
             file=buf,
-            filename="attendance_by_section.png",
-            title="Weekly Attendance by Section"
+            filename="extensions_plot.png",
+            title="Daily Extension Requests"
         )
 
-        if response["ok"]:
-            say("✅ Here is the attendance plot by section!")
-        else:
-            say("⚠️ Failed to upload the attendance plot.")
+        if not response["ok"]:
+            say("⚠️ Failed to upload plot.")
 
-    except Exception as e:
-        print(f"❌ Error in /plot_attendance: {e}")
-        say(f"❌ Error generating attendance plot: {e}")
+    @app.command("/get_grade")
+    def get_grade(ack, say, command):
+        ack()
+        query = command["text"].strip()
 
-@app.command("/plot_extensions")
-@log_command("/plot_extensions")
-def plot_extensions(ack, say, command, client):
-    creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
-    service = build('sheets', 'v4', credentials=creds)
+        if not query:
+            say("⚠️ Please provide a full name or SID. Example: `/get_grade Edwin Vargas Navarro` or `/get_grade 123456789`")
+            return
 
-    result = service.spreadsheets().values().get(
-        spreadsheetId=EXTENSIONS_ID, range=EXTENSIONS_RANGE
-    ).execute()
+        try:
+            say(f"🔍 Fetching grade for `{query}` from Canvas...")
+            course_config = _get_course_config_for_command(command)
+            canvas_creds = course_config["canvas"]
+            canvas = CanvasClient(
+                token=canvas_creds["CANVAS_TOKEN"],
+                base_url=canvas_creds["CANVAS_API_URL"]
+            )
+            course_id = canvas_creds["CANVAS_ID"]
+            grade_data = canvas.get_student_grade(course_id, query)
 
-    rows = result.get("values", [])
-    if not rows:
-        say("⚠️ No extension data found.")
-        return
+            if grade_data is None:
+                say(f"❌ No student found for `{query}`.")
+            elif grade_data["score"] is None:
+                say(f"ℹ️ Found *{grade_data['name']}* (SIS ID: `{grade_data['sis_id']}`), but no grade is available yet.")
+            else:
+                say(f"📊 *{grade_data['name']}* (SIS ID: `{grade_data['sis_id']}`) currently has a grade of *{grade_data['score']:.2f}%*.")
 
-    df = pd.DataFrame(rows[1:], columns=rows[0])
-    df.columns = df.columns.str.strip()
+        except Exception as e:
+            print(f"❌ Error in /get_grade: {e}")
+            say(f"❌ Error fetching grade: {e}")
 
-    # Parse and clean timestamps
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-    df = df.dropna(subset=["Timestamp"])
+    @app.command("/plot_student_radar")
+    def plot_student_radar(ack, say, command, client):
+        ack()
+        name = command["text"].strip()
 
-    # Count by day
-    daily_counts = df["Timestamp"].dt.date.value_counts().sort_index()
+        try:
+            # Fetch Gradescope performance data
+            course_config = _get_course_config_for_command(command)
+            course_id = course_config.get("gradescope_id") or COURSE_ID
+            GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=course_id)
+            GC.update_performance_data()
+            df = GC.get_student_performance_df()
 
-    # Plot
-    plt.figure(figsize=(10, 5))
-    plt.plot(daily_counts.index, daily_counts.values, marker="o", linestyle="-")
-    plt.xticks(rotation=45)
-    plt.title("Daily Extension Requests")
-    plt.xlabel("Date")
-    plt.ylabel("Number of Requests")
-    plt.grid(True)
+            # Load lab attendance data from Google Sheets
+            creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
+            service = build('sheets', 'v4', credentials=creds)
+            result = service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range='Form Responses 1!A1:G'
+            ).execute()
+            rows = result.get("values", [])
+            lab_df = pd.DataFrame(rows[1:], columns=rows[0]) if rows else pd.DataFrame()
 
-    # Save to buffer
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    buf.seek(0)
+            # Fetch Ed involvement data
+            edSlack = EdSlackAPI(command['team_domain'])
+            raw_threads = edSlack.filtered_threads(edSlack.session, "all")
+            raw_df = edSlack.process_json(raw_threads, edSlack.fields)  # raw with 'user'
+            ed_posts_df = edSlack.compute_ed_posts_from_threads(raw_df)  # post counts
+            # Ed posts df must include First Name, Last Name, Ed Posts
 
-    # Upload to Slack
-    response = client.files_upload_v2(
-        channel=command["channel_id"],
-        file=buf,
-        filename="extensions_plot.png",
-        title="Daily Extension Requests"
-    )
+            # Generate radar plot
+            plot_buf = generate_student_radar_plot(name, df, lab_df=lab_df, ed_df=ed_posts_df)
 
-    if not response["ok"]:
-        say("⚠️ Failed to upload plot.")
+            # Upload to Slack
+            client.files_upload_v2(
+                channel=command["channel_id"],
+                file=plot_buf,
+                filename="radar_plot.png",
+                title=f"Radar Plot for REDACTED"
+            )
+            say(f"✅ Here's the radar plot for REDACTED!")
 
+        except Exception as e:
+            print(f"❌ Error generating radar plot: {e}")
+            say(f"❌ Error generating radar plot: {e}")
 
-@app.command("/get_grade")
-def get_grade(ack, say, command):
-    ack()
-    query = command["text"].strip()
-
-    if not query:
-        say("⚠️ Please provide a full name or SID. Example: `/get_grade Edwin Vargas Navarro` or `/get_grade 123456789`")
-        return
-
-    try:
-        say(f"🔍 Fetching grade for `{query}` from Canvas...")
-
-        canvas = CanvasClient(
-            token=credentials["credentials"]["CANVAS_TOKEN"],
-            base_url=credentials["credentials"]["CANVAS_API_URL"]
-        )
-
-        course_id = credentials["credentials"]["CANVAS_ID"]
-        grade_data = canvas.get_student_grade(course_id, query)
-
-        if grade_data is None:
-            say(f"❌ No student found for `{query}`.")
-        elif grade_data["score"] is None:
-            say(f"ℹ️ Found *{grade_data['name']}* (SIS ID: `{grade_data['sis_id']}`), but no grade is available yet.")
-        else:
-            say(f"📊 *{grade_data['name']}* (SIS ID: `{grade_data['sis_id']}`) currently has a grade of *{grade_data['score']:.2f}%*.")
-
-    except Exception as e:
-        print(f"❌ Error in /get_grade: {e}")
-        say(f"❌ Error fetching grade: {e}")
-
-@app.command("/plot_student_radar")
-def plot_student_radar(ack, say, command, client):
-    ack()
-    name = command["text"].strip()
-
-    try:
-        # Fetch Gradescope performance data
-        GC = GradescopeClient(GS_USERNAME, GS_PASSWORD).get_course(course_id=COURSE_ID)
-        GC.update_performance_data()
-        df = GC.get_student_performance_df()
-
-        # Load lab attendance data from Google Sheets
-        creds = Credentials.from_service_account_file("gspread-api.json", scopes=SCOPES)
-        service = build('sheets', 'v4', credentials=creds)
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Form Responses 1!A1:G'
-        ).execute()
-        rows = result.get("values", [])
-        lab_df = pd.DataFrame(rows[1:], columns=rows[0]) if rows else pd.DataFrame()
-
-        # Fetch Ed involvement data
-        edSlack = EdSlackAPI(command['team_domain'])
-        raw_threads = edSlack.filtered_threads(edSlack.session, "all")
-        raw_df = edSlack.process_json(raw_threads, edSlack.fields)  # raw with 'user'
-        ed_posts_df = edSlack.compute_ed_posts_from_threads(raw_df)  # post counts
-        # Ed posts df must include First Name, Last Name, Ed Posts
-
-        # Generate radar plot
-        plot_buf = generate_student_radar_plot(name, df, lab_df=lab_df, ed_df=ed_posts_df)
-
-        # Upload to Slack
-        client.files_upload_v2(
-            channel=command["channel_id"],
-            file=plot_buf,
-            filename="radar_plot.png",
-            title=f"Radar Plot for REDACTED"
-        )
-        say(f"✅ Here's the radar plot for REDACTED!")
-
-    except Exception as e:
-        print(f"❌ Error generating radar plot: {e}")
-        say(f"❌ Error generating radar plot: {e}")
 
 def generate_student_radar_plot(student_name, df, lab_df=None, ed_df=None):
     import matplotlib.pyplot as plt
@@ -712,90 +727,120 @@ def check_unanswered_edposts():
             print(f"⏰ Skipping check at {now.strftime('%H:%M')} - outside active hours.")
             return
 
-        edSlack = EdSlackAPI("data100fall2025")  # Replace with your actual team domain
-        unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
-
-        processed = edSlack.process_json(unresolved_threads, edSlack.fields)
-        overdue_posts = []
-
-        for _, row in processed.iterrows():
-            post_id = row.get("id")
-            title = row.get("title", "Untitled")
-            created_str = row.get("created_at")
-            url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
-
-            if not created_str:
+        # Iterate over all configured courses (or all Slack workspaces if no course keys)
+        course_keys = get_all_course_keys() or list(slack_app_by_team.keys())
+        for team_domain in course_keys:
+            try:
+                course_config = get_course_config(team_domain)
+                ed_course_id = course_config["edstem"]["ED_COURSE_ID"]
+            except Exception as cfg_err:
+                print(f"⚠️ Skipping team_domain '{team_domain}' due to config error: {cfg_err}")
                 continue
 
-            created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
-            hours_passed = (now - created_time).total_seconds() / 3600
-            days = int(hours_passed // 24)
-            hours = int(hours_passed % 24)
-            minutes = int((hours_passed * 60) % 60)
+            edSlack = EdSlackAPI(team_domain)
+            unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
 
-            # Format time string
-            if days >= 1 and hours >= 1:
-                time_str = f"{days}d {hours}h unanswered"
-            elif days >= 1:
-                time_str = f"{days}d unanswered"
-            elif hours >= 1:
-                time_str = f"{hours}h unanswered"
+            processed = edSlack.process_json(unresolved_threads, edSlack.fields)
+            overdue_posts = []
+
+            for _, row in processed.iterrows():
+                post_id = row.get("id")
+                title = row.get("title", "Untitled")
+                created_str = row.get("created_at")
+                url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
+
+                if not created_str:
+                    continue
+
+                created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
+                hours_passed = (now - created_time).total_seconds() / 3600
+                days = int(hours_passed // 24)
+                hours = int(hours_passed % 24)
+                minutes = int((hours_passed * 60) % 60)
+
+                # Format time string
+                if days >= 1 and hours >= 1:
+                    time_str = f"{days}d {hours}h unanswered"
+                elif days >= 1:
+                    time_str = f"{days}d unanswered"
+                elif hours >= 1:
+                    time_str = f"{hours}h unanswered"
+                else:
+                    time_str = f"{minutes}m unanswered"
+
+                overdue_posts.append({
+                    "post_id": post_id,
+                    "title": title,
+                    "url": url,
+                    "time_str": time_str
+                })
+
+            # Sort from oldest to newest
+            overdue_posts.sort(
+                key=lambda post: (int(post["time_str"].split()[0].rstrip("dhm")), post["time_str"]),
+                reverse=True
+            )
+
+            # Send Slack message for this course using this workspace's Slack client
+            slack_app = slack_app_by_team.get(team_domain)
+            if not slack_app:
+                print(f"⚠️ No Slack app for team_domain '{team_domain}' - skipping Ed post alert.")
+                continue
+
+            if overdue_posts:
+                header_message = (
+                    f":rotating_light: *Unanswered Ed Posts That Need Attention for `{team_domain}`!*\n"
+                    "React with :white_check_mark: when resolving a thread."
+                )
             else:
-                time_str = f"{minutes}m unanswered"
+                header_message = (
+                    f":white_check_mark: All Ed posts have been responded to for `{team_domain}`. "
+                    "Nothing to do for now. Great job team!"
+                )
 
-            overdue_posts.append({
-                "post_id": post_id,
-                "title": title,
-                "url": url,
-                "time_str": time_str
-            })
-
-        # Sort from oldest to newest
-        overdue_posts.sort(
-            key=lambda post: (int(post["time_str"].split()[0].rstrip("dhm")), post["time_str"]),
-            reverse=True
-        )
-
-        # Send Slack message
-        if overdue_posts:
-            header_message = (
-                ":rotating_light: *Unanswered Ed Posts That Need Attention!*\n"
-                "React with :white_check_mark: when resolving a thread."
-            )
-        else:
-            header_message = (
-                ":white_check_mark: All Ed posts have been responded to. "
-                "Nothing to do for now. Great job team!"
-            )
-
-        header_response = app.client.chat_postMessage(
-            channel=ALERT_CHANNEL,
-            text=header_message
-        )
-        thread_ts = header_response["ts"]
-
-        if not overdue_posts:
-            print("✅ All posts resolved - no alerts to send.")
-            return
-
-        print(f"📣 Alerting for {len(overdue_posts)} Ed post(s).")
-
-        for post in overdue_posts:
-            message = f"<{post['url']}|{post['title']}> — {post['time_str']}"
-            app.client.chat_postMessage(
+            header_response = slack_app.client.chat_postMessage(
                 channel=ALERT_CHANNEL,
-                text=message,
-                thread_ts=thread_ts,
-                unfurl_links=False,
-                unfurl_media=False
+                text=header_message
             )
+            thread_ts = header_response["ts"]
+
+            if not overdue_posts:
+                print(f"✅ All posts resolved for {team_domain} - no alerts to send.")
+                continue
+
+            print(f"📣 Alerting for {len(overdue_posts)} Ed post(s) in {team_domain}.")
+
+            for post in overdue_posts:
+                message = f"<{post['url']}|{post['title']}> — {post['time_str']}"
+                slack_app.client.chat_postMessage(
+                    channel=ALERT_CHANNEL,
+                    text=message,
+                    thread_ts=thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False
+                )
 
     except Exception as e:
         print(f"❌ Error checking Ed posts: {e}")
 
 def main():
+    global slack_app_by_team
+
+    for team_domain, creds in SLACK_WORKSPACES.items():
+        bot_token = creds.get("SLACK_BOT_TOKEN")
+        app_token = creds.get("SLACK_APP_TOKEN")
+        if not bot_token or not app_token:
+            print(f"⚠️ Skipping workspace '{team_domain}': missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN.")
+            continue
+        app = App(token=bot_token, name=f"seamless-{team_domain}")
+        register_handlers(app)
+        slack_app_by_team[team_domain] = app
+        handler = SocketModeHandler(app, app_token)
+        thread = threading.Thread(target=handler.start, daemon=True)
+        thread.start()
+        print(f"Started Slack handler for workspace: {team_domain}")
+
     scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
-    # Run Ed post alert check at 9am, 1pm, and 5pm Pacific Time
     scheduler.add_job(
         check_unanswered_edposts,
         trigger='cron',
@@ -804,8 +849,8 @@ def main():
     )
     scheduler.start()
 
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    handler.start()
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()

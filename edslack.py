@@ -19,10 +19,12 @@ BASE_URL = "https://us.edstem.org/api/"
 
 class EdSlackAPI:
   def __init__(self, team_domain):
-    os.environ['ED_API_TOKEN'] = credentials['credentials']['ED_APIS'][team_domain]
+    course = credentials['credentials']['courses'][team_domain]
+    edstem = course['edstem']
+    os.environ['ED_API_TOKEN'] = edstem['ED_API_TOKEN']
     self.ed = EdAPI()
     self.ed.login()
-    self.course_id = credentials['credentials']['ED_COURSE_IDS'][team_domain]
+    self.course_id = edstem['ED_COURSE_ID']
     self.session = self.get_session()
     self.fields = ['id', 'user_id', 'type', 'title', 'content', 'category', 'subcategory', 'subsubcategory',
                        'unresolved_count', 'is_answered', 'is_anonymous', 'is_megathread', 'created_at', 'user']

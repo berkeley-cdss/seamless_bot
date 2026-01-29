@@ -4,3 +4,4 @@ gradescope.csv
 gspread-api.json
 venv
 .env
+.venv
