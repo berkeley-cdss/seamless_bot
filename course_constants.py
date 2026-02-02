@@ -14,7 +14,7 @@ GS_PASSWORD = os.getenv("GS_PASSWORD")
 GRADE_THRESHOLD = float(os.getenv("GRADE_THRESHOLD", 0))
 
 # Per-course config loaded from credentials.yml: credentials.courses.<course_key>
-_CREDENTIALS_PATH = Path(__file__).resolve().parent.parent / "config" / "credentials.yml"
+_CREDENTIALS_PATH = Path(__file__).resolve().parent / "config" / "credentials.yml"
 try:
     with open(_CREDENTIALS_PATH, "r") as f:
         _credentials = yaml.safe_load(f)
