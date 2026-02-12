@@ -105,7 +105,7 @@ def register_handlers(app):
 
     @app.command("/current_unresolved")
     @log_command("/current_unresolved")
-    def unresolved_info(ack, say, command):
+    def unresolved_info(ack, say, command, client):
         ack()
         edSlack = EdSlackAPI(command["team_domain"])
 
@@ -119,21 +119,63 @@ def register_handlers(app):
                 say("✅ No unresolved threads found!")
                 return
 
-            processed_unresolved = edSlack.add_subthreads(
-                edSlack.process_user(edSlack.process_json(unresolved_threads, edSlack.fields))
-            )
-            lines = []
-            for _, row in processed_unresolved.head(5).iterrows():
+            now = datetime.now(pytz.timezone("America/Los_Angeles"))
+            processed = edSlack.process_json(unresolved_threads, edSlack.fields)
+            overdue_posts = []
+
+            for _, row in processed.iterrows():
+                post_id = row.get("id")
                 title = row.get("title", "Untitled")
-                post_id = row.get("id", "")
-                link = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
-                lines.append(f"• <{link}|{title}>")
+                created_str = row.get("created_at")
+                url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
 
-            response = f"Hi {command['user_name']}! We have {len(processed_unresolved)} unresolved thread(s):\n" + "\n".join(lines)
-            if len(processed_unresolved) > 5:
-                response += f"\n...and {len(processed_unresolved) - 5} more."
+                if not created_str:
+                    continue
 
-            say(response)
+                created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
+                hours_passed = (now - created_time).total_seconds() / 3600
+                days = int(hours_passed // 24)
+                hours = int(hours_passed % 24)
+                minutes = int((hours_passed * 60) % 60)
+
+                if days >= 1 and hours >= 1:
+                    time_str = f"{days}d {hours}h unanswered"
+                elif days >= 1:
+                    time_str = f"{days}d unanswered"
+                elif hours >= 1:
+                    time_str = f"{hours}h unanswered"
+                else:
+                    time_str = f"{minutes}m unanswered"
+
+                overdue_posts.append({
+                    "post_id": post_id,
+                    "title": title,
+                    "url": url,
+                    "time_str": time_str,
+                    "hours_passed": hours_passed
+                })
+
+            overdue_posts.sort(key=lambda post: post["hours_passed"], reverse=True)
+
+            header_message = (
+                f":rotating_light: *Unanswered Ed Posts That Need Attention!*\n"
+                "React with :white_check_mark: when resolving a thread."
+            )
+            header_response = client.chat_postMessage(
+                channel=command["channel_id"],
+                text=header_message
+            )
+            thread_ts = header_response["ts"]
+
+            for post in overdue_posts:
+                message = f"<{post['url']}|{post['title']}> — {post['time_str']}"
+                client.chat_postMessage(
+                    channel=command["channel_id"],
+                    text=message,
+                    thread_ts=thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False
+                )
 
         except Exception as e:
             print(f"❌ Error in /current_unresolved: {e}")
@@ -772,43 +814,33 @@ def check_unanswered_edposts():
                     "post_id": post_id,
                     "title": title,
                     "url": url,
-                    "time_str": time_str
+                    "time_str": time_str,
+                    "hours_passed": hours_passed
                 })
 
-            # Sort from oldest to newest
-            overdue_posts.sort(
-                key=lambda post: (int(post["time_str"].split()[0].rstrip("dhm")), post["time_str"]),
-                reverse=True
-            )
-
-            # Send Slack message for this course using this workspace's Slack client
-            slack_app = slack_app_by_team.get(team_domain)
-            if not slack_app:
-                print(f"⚠️ No Slack app for team_domain '{team_domain}' - skipping Ed post alert.")
-                continue
-
-            if overdue_posts:
-                header_message = (
-                    f":rotating_light: *Unanswered Ed Posts That Need Attention for `{team_domain}`!*\n"
-                    "React with :white_check_mark: when resolving a thread."
-                )
-            else:
-                header_message = (
-                    f":white_check_mark: All Ed posts have been responded to for `{team_domain}`. "
-                    "Nothing to do for now. Great job team!"
-                )
-
-            header_response = slack_app.client.chat_postMessage(
-                channel=ALERT_CHANNEL,
-                text=header_message
-            )
-            thread_ts = header_response["ts"]
+            # Sort from oldest to newest by actual duration
+            overdue_posts.sort(key=lambda post: post["hours_passed"], reverse=True)
 
             if not overdue_posts:
                 print(f"✅ All posts resolved for {team_domain} - no alerts to send.")
                 continue
 
+            slack_app = slack_app_by_team.get(team_domain)
+            if not slack_app:
+                print(f"⚠️ No Slack app for team_domain '{team_domain}' - skipping Ed post alert.")
+                continue
+
             print(f"📣 Alerting for {len(overdue_posts)} Ed post(s) in {team_domain}.")
+
+            header_message = (
+                f":rotating_light: *Unanswered Ed Posts That Need Attention for `{team_domain}`!*\n"
+                "React with :white_check_mark: when resolving a thread."
+            )
+            header_response = slack_app.client.chat_postMessage(
+                channel=ALERT_CHANNEL,
+                text=header_message
+            )
+            thread_ts = header_response["ts"]
 
             for post in overdue_posts:
                 message = f"<{post['url']}|{post['title']}> — {post['time_str']}"
