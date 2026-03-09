@@ -8,6 +8,8 @@ import numpy as np
 import os
 import yaml
 
+from course_constants import get_course_config
+
 with open("config/credentials.yml", 'r') as stream:
     try:
         credentials = yaml.safe_load(stream)
@@ -19,7 +21,7 @@ BASE_URL = "https://us.edstem.org/api/"
 
 class EdSlackAPI:
   def __init__(self, team_domain):
-    course = credentials['credentials']['courses'][team_domain]
+    course = get_course_config(team_domain)
     edstem = course['edstem']
     os.environ['ED_API_TOKEN'] = edstem['ED_API_TOKEN']
     self.ed = EdAPI()
@@ -88,6 +90,68 @@ class EdSlackAPI:
     response = session.get(BASE_URL + "courses/" + str(self.course_id) + "/threads", params={"filter": filter})
     if response.ok:
       return response.json()["threads"]
+
+  def _resolve_unresolved_flag(self, item):
+    if not isinstance(item, dict):
+      return None
+    if "unresolved" in item:
+      return bool(item.get("unresolved"))
+    if "is_unresolved" in item:
+      return bool(item.get("is_unresolved"))
+    if "resolved" in item:
+      return not bool(item.get("resolved"))
+    if "is_resolved" in item:
+      return not bool(item.get("is_resolved"))
+    if item.get("status") in {"resolved", "unresolved"}:
+      return item.get("status") == "unresolved"
+    return None
+
+  def get_unresolved_activity_timestamps(self, thread_id, unresolved_count=None, student_thread=False):
+    thread_json = self.ed.get_thread(thread_id)
+    comments = thread_json.get("comments", []) if isinstance(thread_json, dict) else []
+    answers = thread_json.get("answers", []) if isinstance(thread_json, dict) else []
+    all_timestamps = []
+    explicitly_unresolved = []
+    has_explicit_unresolved_flags = False
+
+    for item in (comments + answers):
+      if not isinstance(item, dict):
+        continue
+      if student_thread:
+        user = item.get("user", {}) if isinstance(item.get("user", {}), dict) else {}
+        role = str(user.get("course_role", "")).lower()
+        # For student-authored threads, ignore staff-side follow-ups in range windows.
+        if role in {"staff", "instructor", "ta", "lead"}:
+          continue
+      unresolved_flag = self._resolve_unresolved_flag(item)
+      if unresolved_flag is not None:
+        has_explicit_unresolved_flags = True
+      created_at = item.get("created_at")
+      if not created_at:
+        continue
+      try:
+        ts = parse(created_at)
+        all_timestamps.append(ts)
+        if unresolved_flag is True:
+          explicitly_unresolved.append(ts)
+      except Exception:
+        continue
+    all_timestamps.sort()
+    explicitly_unresolved.sort()
+
+    if has_explicit_unresolved_flags:
+      return explicitly_unresolved
+
+    # Fallback: when unresolved flags are absent, approximate by newest unresolved_count items.
+    if unresolved_count is not None:
+      try:
+        count = int(unresolved_count)
+      except (TypeError, ValueError):
+        count = 0
+      if count > 0 and len(all_timestamps) >= count:
+        return all_timestamps[-count:]
+
+    return all_timestamps
   
   def compute_ed_posts_from_threads(self, threads_df):
       threads_df["Full Name"] = threads_df["user"].apply(

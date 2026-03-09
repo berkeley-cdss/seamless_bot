@@ -40,6 +40,7 @@ import threading
 # Edstem Tracker
 ALERT_CHANNEL = "#ed"  # Replace with your real Slack channel
 NOTIFY_HOURS = (8, 23)  # Only send pings between 08:00–23:59
+SLACK_TEXT_LIMIT = 3500
 
 # Google Sheets API
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -97,6 +98,180 @@ def log_command(command_name):
         return wrapper
     return decorator
 
+def _to_local_timestamp(raw_value):
+    timestamp = pd.to_datetime(raw_value, errors="coerce", utc=True)
+    if pd.isna(timestamp):
+        return None
+    return timestamp.tz_convert("America/Los_Angeles")
+
+def _format_elapsed_from_hours(hours_passed):
+    days = int(hours_passed // 24)
+    hours = int(hours_passed % 24)
+    minutes = int((hours_passed * 60) % 60)
+
+    if days >= 1 and hours >= 1:
+        return f"{days}d {hours}h unanswered"
+    if days >= 1:
+        return f"{days}d unanswered"
+    if hours >= 1:
+        return f"{hours}h unanswered"
+    return f"{minutes}m unanswered"
+
+def _format_relative_time(created_str, now):
+    created_time = _to_local_timestamp(created_str)
+    if created_time is None:
+        return "unknown time"
+    hours_passed = max((now - created_time).total_seconds() / 3600, 0)
+    return _format_elapsed_from_hours(hours_passed).replace(" unanswered", " ago")
+
+def _format_range_from_timestamps(timestamps, now):
+    if not timestamps:
+        return "time unavailable"
+    if len(timestamps) == 1:
+        return _format_relative_time(timestamps[0].isoformat(), now)
+    oldest = _format_relative_time(timestamps[0].isoformat(), now)
+    newest = _format_relative_time(timestamps[-1].isoformat(), now)
+    return f"{newest} to {oldest}"
+
+def _split_long_text(text, max_len=SLACK_TEXT_LIMIT):
+    if len(text) <= max_len:
+        return [text]
+
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= max_len:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        if len(line) <= max_len:
+            current = line
+        else:
+            start = 0
+            while start < len(line):
+                chunks.append(line[start : start + max_len])
+                start += max_len
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+def _chunk_sections(sections, max_len=SLACK_TEXT_LIMIT):
+    chunks, current = [], ""
+    for section in sections:
+        section_parts = _split_long_text(section, max_len=max_len)
+        for part in section_parts:
+            candidate = part if not current else f"{current}\n\n{part}"
+            if len(candidate) <= max_len:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+            current = part
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+def _build_unresolved_posts(ed_slack, ed_course_id, now):
+    unresolved_threads = ed_slack.filtered_threads(ed_slack.session, "unresolved") or []
+    if not unresolved_threads:
+        return []
+
+    processed = ed_slack.process_json(unresolved_threads, ed_slack.fields)
+    overdue_posts = []
+
+    for _, row in processed.iterrows():
+        post_id = row.get("id")
+        if not post_id:
+            continue
+
+        title = row.get("title", "Untitled")
+        created_time = _to_local_timestamp(row.get("created_at"))
+        post_url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
+        unresolved_count = row.get("unresolved_count")
+        if pd.isna(unresolved_count):
+            unresolved_count = 0
+        try:
+            unresolved_count = int(unresolved_count)
+        except (TypeError, ValueError):
+            unresolved_count = 0
+
+        thread_user = row.get("user", {})
+        is_student_thread = isinstance(thread_user, dict) and thread_user.get("course_role") == "student"
+        timestamps = []
+        try:
+            if is_student_thread:
+                # For student-authored question threads, use thread post time only.
+                timestamps = [created_time] if created_time is not None else []
+            else:
+                timestamps = ed_slack.get_unresolved_activity_timestamps(
+                    post_id,
+                    unresolved_count=unresolved_count,
+                    student_thread=False,
+                )
+            range_text = _format_range_from_timestamps(timestamps, now)
+        except Exception:
+            range_text = "time unavailable"
+
+        oldest_activity_hours = None
+        if timestamps:
+            oldest_activity_hours = max((now - timestamps[0]).total_seconds() / 3600, 0)
+        elif created_time is not None:
+            oldest_activity_hours = max((now - created_time).total_seconds() / 3600, 0)
+        else:
+            oldest_activity_hours = -1
+
+        # Ignore false positives where the unresolved filter includes zero unresolved activity.
+        effective_unresolved_count = unresolved_count if unresolved_count > 0 else len(timestamps)
+        if effective_unresolved_count <= 0:
+            continue
+
+        overdue_posts.append(
+            {
+                "post_id": post_id,
+                "title": title,
+                "url": post_url,
+                "hours_passed": oldest_activity_hours,
+                "unresolved_count": effective_unresolved_count,
+                "range_text": range_text,
+            }
+        )
+
+    overdue_posts.sort(key=lambda post: post["hours_passed"], reverse=True)
+    return overdue_posts
+
+def _render_unresolved_sections(overdue_posts):
+    sections = []
+    for post in overdue_posts:
+        window_label = f"unresolved activity window: {post['range_text']}"
+        if post["unresolved_count"] == 1:
+            sections.append(f"*<{post['url']}|{post['title']}>* | {window_label}")
+        else:
+            sections.append(
+                f"*<{post['url']}|{post['title']}>* | {post['unresolved_count']} unresolved | {window_label}"
+            )
+    return sections
+
+def _post_threaded_sections(client, channel_id, header_message, sections):
+    header_response = client.chat_postMessage(channel=channel_id, text=header_message)
+    thread_ts = header_response["ts"]
+    # Keep one Slack reply per post for easier TA scanning.
+    for section in sections:
+        for chunk in _split_long_text(section):
+            client.chat_postMessage(
+                channel=channel_id,
+                text=chunk,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+    return thread_ts
+
 def register_handlers(app):
     @app.event("app_mention")
     def event_test(event, say):
@@ -104,7 +279,6 @@ def register_handlers(app):
         say("Hi there!")
 
     @app.command("/current_unresolved")
-    @log_command("/current_unresolved")
     def unresolved_info(ack, say, command, client):
         ack()
         edSlack = EdSlackAPI(command["team_domain"])
@@ -112,70 +286,19 @@ def register_handlers(app):
         try:
             course_config = _get_course_config_for_command(command)
             ed_course_id = course_config["edstem"]["ED_COURSE_ID"]
+            now = datetime.now(pytz.timezone("America/Los_Angeles"))
+            overdue_posts = _build_unresolved_posts(edSlack, ed_course_id, now)
 
-            unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
-
-            if not unresolved_threads:
+            if not overdue_posts:
                 say("✅ No unresolved threads found!")
                 return
-
-            now = datetime.now(pytz.timezone("America/Los_Angeles"))
-            processed = edSlack.process_json(unresolved_threads, edSlack.fields)
-            overdue_posts = []
-
-            for _, row in processed.iterrows():
-                post_id = row.get("id")
-                title = row.get("title", "Untitled")
-                created_str = row.get("created_at")
-                url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
-
-                if not created_str:
-                    continue
-
-                created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
-                hours_passed = (now - created_time).total_seconds() / 3600
-                days = int(hours_passed // 24)
-                hours = int(hours_passed % 24)
-                minutes = int((hours_passed * 60) % 60)
-
-                if days >= 1 and hours >= 1:
-                    time_str = f"{days}d {hours}h unanswered"
-                elif days >= 1:
-                    time_str = f"{days}d unanswered"
-                elif hours >= 1:
-                    time_str = f"{hours}h unanswered"
-                else:
-                    time_str = f"{minutes}m unanswered"
-
-                overdue_posts.append({
-                    "post_id": post_id,
-                    "title": title,
-                    "url": url,
-                    "time_str": time_str,
-                    "hours_passed": hours_passed
-                })
-
-            overdue_posts.sort(key=lambda post: post["hours_passed"], reverse=True)
 
             header_message = (
                 f":rotating_light: *Unanswered Ed Posts That Need Attention!*\n"
                 "React with :white_check_mark: when resolving a thread."
             )
-            header_response = client.chat_postMessage(
-                channel=command["channel_id"],
-                text=header_message
-            )
-            thread_ts = header_response["ts"]
-
-            for post in overdue_posts:
-                message = f"<{post['url']}|{post['title']}> — {post['time_str']}"
-                client.chat_postMessage(
-                    channel=command["channel_id"],
-                    text=message,
-                    thread_ts=thread_ts,
-                    unfurl_links=False,
-                    unfurl_media=False
-                )
+            sections = _render_unresolved_sections(overdue_posts)
+            _post_threaded_sections(client, command["channel_id"], header_message, sections)
 
         except Exception as e:
             print(f"❌ Error in /current_unresolved: {e}")
@@ -780,46 +903,7 @@ def check_unanswered_edposts():
                 continue
 
             edSlack = EdSlackAPI(team_domain)
-            unresolved_threads = edSlack.filtered_threads(edSlack.session, "unresolved")
-
-            processed = edSlack.process_json(unresolved_threads, edSlack.fields)
-            overdue_posts = []
-
-            for _, row in processed.iterrows():
-                post_id = row.get("id")
-                title = row.get("title", "Untitled")
-                created_str = row.get("created_at")
-                url = f"https://edstem.org/us/courses/{ed_course_id}/discussion/{post_id}"
-
-                if not created_str:
-                    continue
-
-                created_time = pd.to_datetime(created_str).tz_convert("America/Los_Angeles")
-                hours_passed = (now - created_time).total_seconds() / 3600
-                days = int(hours_passed // 24)
-                hours = int(hours_passed % 24)
-                minutes = int((hours_passed * 60) % 60)
-
-                # Format time string
-                if days >= 1 and hours >= 1:
-                    time_str = f"{days}d {hours}h unanswered"
-                elif days >= 1:
-                    time_str = f"{days}d unanswered"
-                elif hours >= 1:
-                    time_str = f"{hours}h unanswered"
-                else:
-                    time_str = f"{minutes}m unanswered"
-
-                overdue_posts.append({
-                    "post_id": post_id,
-                    "title": title,
-                    "url": url,
-                    "time_str": time_str,
-                    "hours_passed": hours_passed
-                })
-
-            # Sort from oldest to newest by actual duration
-            overdue_posts.sort(key=lambda post: post["hours_passed"], reverse=True)
+            overdue_posts = _build_unresolved_posts(edSlack, ed_course_id, now)
 
             if not overdue_posts:
                 print(f"✅ All posts resolved for {team_domain} - no alerts to send.")
@@ -836,21 +920,8 @@ def check_unanswered_edposts():
                 f":rotating_light: *Unanswered Ed Posts That Need Attention for `{team_domain}`!*\n"
                 "React with :white_check_mark: when resolving a thread."
             )
-            header_response = slack_app.client.chat_postMessage(
-                channel=ALERT_CHANNEL,
-                text=header_message
-            )
-            thread_ts = header_response["ts"]
-
-            for post in overdue_posts:
-                message = f"<{post['url']}|{post['title']}> — {post['time_str']}"
-                slack_app.client.chat_postMessage(
-                    channel=ALERT_CHANNEL,
-                    text=message,
-                    thread_ts=thread_ts,
-                    unfurl_links=False,
-                    unfurl_media=False
-                )
+            sections = _render_unresolved_sections(overdue_posts)
+            _post_threaded_sections(slack_app.client, ALERT_CHANNEL, header_message, sections)
 
     except Exception as e:
         print(f"❌ Error checking Ed posts: {e}")
